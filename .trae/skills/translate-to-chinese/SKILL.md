@@ -41,6 +41,8 @@ description: "Download webpage and translate content to Chinese with bilingual o
    - 如果段落内容较少，合并相邻段落一起翻译
    - 翻译必须忠实原文，不能添加原文没有的内容
    - 不能改变文章结构和内容，只做翻译
+   - **保留 Markdown 图片语法不翻译**：`![alt text](image-url)` 格式的图片标记保持原样
+   - **保留图片链接不翻译**：图片的 URL 路径保持原样
 4. **生成双语文档** - 创建中英文交错的新文档：
    - 格式：英文原文 + 中文翻译
    - 保存到与原 Markdown 相同的目录
@@ -85,4 +87,27 @@ Next paragraph in English...
 - 保持原文的段落结构和格式
 - 专业术语保持准确性
 - 代码块、链接、图片路径保持不变
+- **图片处理**：Markdown 图片语法 `![描述](图片链接)` 和图片链接保持原样，不进行翻译
 - 短段落（少于100字）可以合并翻译以提高流畅度
+
+## 图片处理规则
+
+在翻译过程中，以下内容保持原样：
+
+1. **Markdown 图片语法**：
+   ```markdown
+   ![图片描述](images/photo.jpg)
+   ![alt text](https://example.com/image.png)
+   ```
+   以上格式保持原样，不翻译 `![` 和 `](...)` 部分
+
+2. **图片链接**：
+   - 本地图片路径：`images/photo.jpg`、`./assets/image.png`
+   - 网络图片 URL：`https://example.com/image.png`
+   这些链接保持原样，不进行翻译
+
+3. **HTML 图片标签**（如有）：
+   ```html
+   <img src="images/photo.jpg" alt="description">
+   ```
+   保持标签和属性值原样

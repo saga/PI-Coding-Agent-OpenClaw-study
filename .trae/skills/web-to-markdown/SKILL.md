@@ -58,14 +58,53 @@ https://example.com/article
 
 1. **获取网页** - 使用 `mcp_Fetch_fetch` 工具获取 URL 内容
 2. **处理内容** - 工具会自动将 HTML 转换为 Markdown
-3. **保存文件** - 将 Markdown 内容写入指定位置
+3. **处理图片** - 如果文章中有图片：
+   - 创建 `images/` 子目录（与 Markdown 文件同目录）
+   - 下载图片到 `images/` 目录
+   - 更新 Markdown 中的图片链接为本地相对路径
+   - **如果图片下载失败，保留原始 URL 链接，不要重试**
+4. **保存文件** - 将 Markdown 内容写入指定位置
+
+## 图片处理
+
+当文章包含图片时，执行以下步骤：
+
+1. **创建图片目录** - 在 Markdown 文件所在目录创建 `images/` 子文件夹
+   ```
+   glm5-studydoc/
+   ├── article.md
+   └── images/
+       ├── image1.png
+       ├── image2.jpg
+       └── ...
+   ```
+
+2. **下载图片** - 提取 Markdown 中的所有图片链接：
+   - 下载每个图片到 `images/` 目录
+   - 使用原始文件名或生成有意义的文件名
+   - 支持的格式：png, jpg, jpeg, gif, svg, webp
+
+3. **更新链接** - 修改 Markdown 中的图片引用：
+   ```markdown
+   <!-- 原始链接 -->
+   ![描述](https://example.com/path/to/image.png)
+   
+   <!-- 更新为本地链接 -->
+   ![描述](images/image.png)
+   ```
+
+4. **失败处理** - 如果图片下载失败：
+   - **保留原始 URL 链接**
+   - 不进行重试
+   - 可选：在 Markdown 中添加注释说明下载失败
 
 ## 输出格式
 
 转换后的 Markdown 包含：
 - 标题（来自 `<title>` 或 `<h1>`）
 - 主要内容（文章正文，排除导航/广告）
-- 保留的链接和图片
+- 保留的链接
+- **图片链接指向本地 `images/` 目录（下载成功）或原始 URL（下载失败）**
 - 带语法高亮的代码块
 
 ## 示例
@@ -76,7 +115,11 @@ https://example.com/article
 执行动作：
 1. 使用 `mcp_Fetch_fetch` 获取 URL 内容
 2. 创建合适的文件名（如 `pi-mono.md`）
-3. 默认保存到学习文档目录
+3. 检查内容中的图片
+4. 创建 `glm5-studydoc/images/` 目录
+5. 下载图片到该目录
+6. 更新 Markdown 中的图片链接
+7. 保存 Markdown 文件到学习文档目录
 
 ## 注意事项
 
