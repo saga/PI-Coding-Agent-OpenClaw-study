@@ -42,7 +42,7 @@ description: "Download PDF from URL, save locally, and translate content to rigo
    - 记录总页数
 
 3. **分批次翻译** - 分段翻译内容：
-   - 每批次翻译 5-10 页（或约 5000 字）
+   - 每批次翻译 4-8 页（或约 3000 字）
    - 翻译必须忠实原文，不能添加原文没有的内容
    - 保持原文结构和格式
    - **如果是 PDF 中的图片，在翻译结果中添加 `<图片>` 占位符表示**
