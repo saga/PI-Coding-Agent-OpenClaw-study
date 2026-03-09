@@ -7,4 +7,16 @@ requires-python = ">=3.12"
 dependencies = [
     "pdfplumber>=0.11.9",
     "pypdfium2>=5.6.0",
+    "mermaid-py",
+    "requests",
+    "httpx",
+    "dotenv",
+    "cachetools",
+    "pydantic",
+    "pydantic-ai-slim[fastmcp]",
+    "xmltodict",
+    "msal",
+    "langgraph",
+    "langchain_openai",
+    "openai"
 ]
