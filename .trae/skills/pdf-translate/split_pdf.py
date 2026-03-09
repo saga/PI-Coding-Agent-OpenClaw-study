@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-PDF Splitter - 将 PDF 按页切分成多个文件，并提取为 Markdown
-使用 pypdfium2 (切分) + pdfplumber (文本提取)
+PDF to Images & Markdown - 将 PDF 每页转换为图片和 Markdown
+使用 pypdfium2 (PDF渲染+切分) + pdfplumber (文本提取)
 License: Apache 2.0 + MIT (均可商业使用)
-使用方法: python split_pdf.py <input.pdf> [output_dir]
+使用方法: python split_pdf.py <input.pdf> [output_dir] [dpi]
 """
 
 import sys
 import os
-import re
 
 try:
     import pypdfium2 as pdfium
@@ -21,6 +20,21 @@ try:
 except ImportError:
     print("请先安装 pdfplumber: pip install pdfplumber")
     sys.exit(1)
+
+
+def pdf_page_to_image(pdf, page_num, output_path, dpi=150):
+    """使用 pypdfium2 将 PDF 单页渲染为图片"""
+    try:
+        # 渲染页面为位图
+        bitmap = pdf[page_num].render(scale=dpi/72)  # 72 是 PDF 默认 DPI
+        # 转换为 PIL Image
+        pil_image = bitmap.to_pil()
+        # 保存为 PNG
+        pil_image.save(output_path, "PNG")
+        return True
+    except Exception as e:
+        print(f"  渲染图片失败: {e}")
+        return False
 
 
 def extract_page_to_markdown(pdf_path, page_num):
@@ -79,7 +93,7 @@ def extract_page_to_markdown(pdf_path, page_num):
     return '\n'.join(markdown_content)
 
 
-def split_pdf(input_path, output_dir=None):
+def split_pdf(input_path, output_dir=None, dpi=150):
     if not os.path.exists(input_path):
         print(f"错误: 文件不存在 - {input_path}")
         return False
@@ -92,30 +106,35 @@ def split_pdf(input_path, output_dir=None):
     split_dir = os.path.join(output_dir, f"{base_name}-split")
     os.makedirs(split_dir, exist_ok=True)
     
+    # 创建图片子目录
+    images_dir = os.path.join(split_dir, "images")
+    os.makedirs(images_dir, exist_ok=True)
+    
     print(f"输出目录: {split_dir}")
+    print(f"图片目录: {images_dir}")
+    print(f"渲染 DPI: {dpi}")
     
     try:
-        # 使用 pypdfium2 切分 PDF
+        # 使用 pypdfium2 打开 PDF
         pdf = pdfium.PdfDocument(input_path)
         total_pages = len(pdf)
         print(f"总页数: {total_pages}")
         
         # 创建汇总 Markdown 文件
-        summary_md = [f"# {base_name}\n", f"**总页数**: {total_pages}\n", "---\n"]
+        summary_md = [f"# {base_name}\n", f"**总页数**: {total_pages}\n", f"**渲染 DPI**: {dpi}\n", "---\n"]
         
         for i in range(total_pages):
             page_idx = i + 1
+            print(f"\n处理第 {page_idx}/{total_pages} 页...")
             
-            # 1. 切分 PDF 单页
-            new_pdf = pdfium.PdfDocument.new()
-            new_pdf.import_pages(pdf, [i])
+            # 1. 渲染页面为图片
+            img_filename = f"{base_name}-page-{page_idx:03d}.png"
+            img_path = os.path.join(images_dir, img_filename)
             
-            pdf_filename = f"{base_name}-page-{page_idx:03d}.pdf"
-            pdf_path = os.path.join(split_dir, pdf_filename)
-            with open(pdf_path, "wb") as output_file:
-                output_file.write(new_pdf.write())
-            
-            print(f"已创建 PDF: {pdf_filename}")
+            if pdf_page_to_image(pdf, i, img_path, dpi):
+                print(f"  ✓ 图片: {img_filename}")
+            else:
+                print(f"  ✗ 图片生成失败")
             
             # 2. 提取 Markdown
             md_content = extract_page_to_markdown(input_path, page_idx)
@@ -124,30 +143,50 @@ def split_pdf(input_path, output_dir=None):
                 md_filename = f"{base_name}-page-{page_idx:03d}.md"
                 md_path = os.path.join(split_dir, md_filename)
                 
-                # 添加页面分隔标记
-                full_md = f"<!-- 第 {page_idx} 页 -->\n\n{md_content}\n\n---\n"
+                # 添加页面分隔标记和图片引用
+                full_md = f"<!-- 第 {page_idx} 页 -->\n\n"
+                full_md += f"![第 {page_idx} 页](images/{img_filename})\n\n"
+                full_md += f"{md_content}\n\n---\n"
                 
                 with open(md_path, "w", encoding="utf-8") as f:
                     f.write(full_md)
                 
-                print(f"已创建 Markdown: {md_filename}")
+                print(f"  ✓ Markdown: {md_filename}")
                 
                 # 添加到汇总
-                summary_md.append(f"## 第 {page_idx} 页\n")
-                summary_md.append(md_content[:500] + "...\n" if len(md_content) > 500 else md_content + "\n")
+                summary_md.append(f"## 第 {page_idx} 页\n\n")
+                summary_md.append(f"![第 {page_idx} 页](images/{img_filename})\n\n")
+                summary_md.append(md_content[:300] + "...\n" if len(md_content) > 300 else md_content + "\n")
                 summary_md.append(f"[查看完整内容]({md_filename})\n\n---\n")
             else:
-                print(f"警告: 第 {page_idx} 页无文本内容")
+                # 即使没有文本也创建 Markdown 文件（只有图片）
+                md_filename = f"{base_name}-page-{page_idx:03d}.md"
+                md_path = os.path.join(split_dir, md_filename)
+                
+                full_md = f"<!-- 第 {page_idx} 页 -->\n\n"
+                full_md += f"![第 {page_idx} 页](images/{img_filename})\n\n"
+                full_md += "<!-- 本页无文本内容 -->\n\n---\n"
+                
+                with open(md_path, "w", encoding="utf-8") as f:
+                    f.write(full_md)
+                
+                print(f"  ✓ Markdown: {md_filename} (无文本)")
+                summary_md.append(f"## 第 {page_idx} 页\n\n")
+                summary_md.append(f"![第 {page_idx} 页](images/{img_filename})\n\n")
+                summary_md.append("*本页无文本内容*\n\n---\n")
         
         # 3. 保存汇总 Markdown
         summary_path = os.path.join(split_dir, f"{base_name}-summary.md")
         with open(summary_path, "w", encoding="utf-8") as f:
             f.write('\n'.join(summary_md))
         
-        print(f"\n✅ 完成!")
-        print(f"   - 共切分 {total_pages} 页")
-        print(f"   - PDF 文件: {split_dir}")
+        print(f"\n{'='*50}")
+        print(f"✅ 完成!")
+        print(f"   - 共处理 {total_pages} 页")
+        print(f"   - 输出目录: {split_dir}")
+        print(f"   - 图片目录: {images_dir}")
         print(f"   - 汇总文档: {summary_path}")
+        print(f"{'='*50}")
         return True
         
     except Exception as e:
@@ -159,11 +198,19 @@ def split_pdf(input_path, output_dir=None):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("使用方法: python split_pdf.py <input.pdf> [output_dir]")
-        print("示例: python split_pdf.py document.pdf ./output")
+        print("使用方法: python split_pdf.py <input.pdf> [output_dir] [dpi]")
+        print("示例:")
+        print("  python split_pdf.py document.pdf")
+        print("  python split_pdf.py document.pdf ./output")
+        print("  python split_pdf.py document.pdf ./output 200")
+        print("\n参数:")
+        print("  input.pdf   - 输入 PDF 文件")
+        print("  output_dir  - 输出目录（可选，默认为 PDF 所在目录）")
+        print("  dpi         - 渲染 DPI（可选，默认 150，建议 150-300）")
         sys.exit(1)
     
     input_pdf = sys.argv[1]
     output_dir = sys.argv[2] if len(sys.argv) > 2 else None
+    dpi = int(sys.argv[3]) if len(sys.argv) > 3 else 150
     
-    split_pdf(input_pdf, output_dir)
+    split_pdf(input_pdf, output_dir, dpi)

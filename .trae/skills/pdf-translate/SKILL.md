@@ -36,28 +36,34 @@ description: "Download PDF from URL, save locally, and translate content to rigo
    - 保存到 `glm5-studydoc/` 目录（或用户指定的目录）
    - 文件名从 URL 提取或使用默认名称
 
-2. **切分 PDF 并提取 Markdown** - 按页切分并提取文本
+2. **PDF 转图片并提取 Markdown** - 每页渲染为图片并提取文本
    - 使用 `split_pdf.py` 脚本（pypdfium2 + pdfplumber）
    - 安装依赖: `pip install pypdfium2 pdfplumber`
-   - 命令: `python split_pdf.py <input.pdf> [output_dir]`
+   - 命令: `python split_pdf.py <input.pdf> [output_dir] [dpi]`
    - 输出目录结构:
      ```
      {原文件名}-split/
-     ├── {原文件名}-page-001.pdf    # 单页 PDF
-     ├── {原文件名}-page-001.md     # Markdown 文本
-     ├── {原文件名}-page-002.pdf
-     ├── {原文件名}-page-002.md
-     └── {原文件名}-summary.md      # 汇总文档
+     ├── images/                              # 图片目录
+     │   ├── {原文件名}-page-001.png          # 第 1 页图片
+     │   ├── {原文件名}-page-002.png          # 第 2 页图片
+     │   └── ...
+     ├── {原文件名}-page-001.md               # 第 1 页 Markdown（含图片引用）
+     ├── {原文件名}-page-002.md               # 第 2 页 Markdown
+     └── {原文件名}-summary.md                # 汇总文档
      ```
+   - 每页渲染为 PNG 图片（默认 DPI 150，可选 150-300）
+   - Markdown 文件自动引用对应页图片: `![第 X 页](images/xxx.png)`
    - Markdown 文件包含页面分隔标记 `<!-- 第 X 页 -->`
    - 表格转换为 Markdown 表格格式
    - 图片位置标记为 `<图片 N>`
 
-3. **逐页翻译** - 将切分后的每页 PDF 内容翻译成中文
-   - 由于 AI 无法直接读取 PDF，需要用户手动提取文本或使用 OCR
+3. **逐页翻译** - 读取切分后的 Markdown 文件进行翻译
+   - 读取 `{原文件名}-split/{原文件名}-page-XXX.md` 文件
+   - 逐页翻译 Markdown 内容
    - 翻译必须忠实原文，不能添加原文没有的内容
    - 保持原文结构和格式
-   - **如果是 PDF 中的图片，在翻译结果中添加 `<图片>` 占位符表示**
+   - **保留页面标记**: `<!-- 第 X 页 -->`
+   - **保留图片标记**: `<图片 N>`
 
 4. **用户确认** - 每完成一批次后：
    - 展示已翻译的内容摘要
@@ -126,10 +132,18 @@ description: "Download PDF from URL, save locally, and translate content to rigo
 
 执行动作：
 1. 下载 PDF 到 `glm5-studydoc/paper.pdf`
-2. 切分 PDF 到 `glm5-studydoc/split_pages/paper-page-001.pdf` 等文件
-3. 提示用户需要手动提取文本或使用 OCR
-4. 用户逐页提供文本内容，AI 进行翻译
-5. 合并所有翻译内容保存到 `glm5-studydoc/paper-translated.md`
+2. 运行转换脚本（DPI 200 以获得更清晰的图片）：
+   ```bash
+   python .trae/skills/pdf-translate/split_pdf.py glm5-studydoc/paper.pdf glm5-studydoc 200
+   ```
+3. 生成目录 `glm5-studydoc/paper-split/` 包含：
+   - `images/paper-page-001.png` - 第 1 页高清图片
+   - `images/paper-page-002.png` - 第 2 页高清图片
+   - `paper-page-001.md` - 第 1 页 Markdown（含图片引用）
+   - `paper-page-002.md` - 第 2 页 Markdown
+   - `paper-summary.md` - 汇总文档
+4. 读取 `paper-page-001.md` 进行翻译（Markdown 中已包含图片）
+5. 逐页翻译后合并保存到 `glm5-studydoc/paper-translated.md`
 
 ## 注意事项
 
