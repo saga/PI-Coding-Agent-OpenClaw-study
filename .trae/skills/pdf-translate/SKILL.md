@@ -32,17 +32,29 @@ description: "Download PDF from URL, save locally, and translate content to rigo
 ## 工作流程
 
 1. **下载 PDF** - 从 URL 下载 PDF 文件
-   - 使用 `curl` 或 `wget` 下载 PDF
+   - 使用 `Invoke-WebRequest` (PowerShell) 下载 PDF
    - 保存到 `glm5-studydoc/` 目录（或用户指定的目录）
    - 文件名从 URL 提取或使用默认名称
 
-2. **读取 PDF** - 提取 PDF 内容
-   - 使用 `pdftotext` 或类似工具提取文本
-   - 如果是扫描版 PDF（图片），使用 OCR 识别
-   - 记录总页数
+2. **切分 PDF 并提取 Markdown** - 按页切分并提取文本
+   - 使用 `split_pdf.py` 脚本（pypdfium2 + pdfplumber）
+   - 安装依赖: `pip install pypdfium2 pdfplumber`
+   - 命令: `python split_pdf.py <input.pdf> [output_dir]`
+   - 输出目录结构:
+     ```
+     {原文件名}-split/
+     ├── {原文件名}-page-001.pdf    # 单页 PDF
+     ├── {原文件名}-page-001.md     # Markdown 文本
+     ├── {原文件名}-page-002.pdf
+     ├── {原文件名}-page-002.md
+     └── {原文件名}-summary.md      # 汇总文档
+     ```
+   - Markdown 文件包含页面分隔标记 `<!-- 第 X 页 -->`
+   - 表格转换为 Markdown 表格格式
+   - 图片位置标记为 `<图片 N>`
 
-3. **分批次翻译** - 分段翻译内容：
-   - 每批次翻译 4-8 页（或约 3000 字）
+3. **逐页翻译** - 将切分后的每页 PDF 内容翻译成中文
+   - 由于 AI 无法直接读取 PDF，需要用户手动提取文本或使用 OCR
    - 翻译必须忠实原文，不能添加原文没有的内容
    - 保持原文结构和格式
    - **如果是 PDF 中的图片，在翻译结果中添加 `<图片>` 占位符表示**
@@ -114,17 +126,22 @@ description: "Download PDF from URL, save locally, and translate content to rigo
 
 执行动作：
 1. 下载 PDF 到 `glm5-studydoc/paper.pdf`
-2. 读取 PDF，发现共 25 页
-3. 翻译第 1-10 页
-4. 展示翻译结果，询问用户是否继续
-5. 用户确认后继续翻译第 11-20 页
-6. 再次确认，翻译第 21-25 页
-7. 合并所有内容保存到 `glm5-studydoc/paper-translated.md`
+2. 切分 PDF 到 `glm5-studydoc/split_pages/paper-page-001.pdf` 等文件
+3. 提示用户需要手动提取文本或使用 OCR
+4. 用户逐页提供文本内容，AI 进行翻译
+5. 合并所有翻译内容保存到 `glm5-studydoc/paper-translated.md`
 
 ## 注意事项
 
-- PDF 文件可能较大，下载需要时间
-- 扫描版 PDF 需要 OCR，识别准确率可能不是 100%
-- 复杂排版（多栏、表格）可能需要手动调整
-- 数学公式保持原样或用 LaTeX 表示
-- 代码块保持原样，仅翻译注释
+- **环境要求**: 需要安装 Python 和两个库：
+  ```bash
+  pip install pypdfium2 pdfplumber
+  ```
+- **License**: 
+  - pypdfium2: Apache 2.0（可商业使用）
+  - pdfplumber: MIT（可商业使用）
+- **引擎**: pypdfium2 使用 Google PDFium 引擎，pdfplumber 使用 pdfminer.six
+- **文本提取**: 脚本会自动提取 Markdown，但复杂排版可能需要手动调整
+- **扫描版 PDF**: 需要 OCR 处理后才能提取文本
+- **数学公式**: 保持原样或用 LaTeX 表示
+- **代码块**: 保持原样，仅翻译注释
