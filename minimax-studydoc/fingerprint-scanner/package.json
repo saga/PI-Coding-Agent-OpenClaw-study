@@ -1,0 +1,37 @@
+{
+  "name": "repo-fingerprint-scanner",
+  "version": "1.0.0",
+  "description": "Enterprise Git Repository Fingerprint Scanner - File Indexer and Fingerprint Engine",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "scan": "node dist/index.js"
+  },
+  "keywords": [
+    "fingerprint",
+    "scanner",
+    "repository",
+    "indexer",
+    "detector"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "fast-glob": "^3.3.0",
+    "sqlite3": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}

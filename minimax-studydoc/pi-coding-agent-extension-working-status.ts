@@ -1,5 +1,9 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
+/**
+ * Enhanced Working Status Extension for pi-coding-agent
+ * Displays real-time status updates with spinners, timing, and progress indicators
+ */
 export default function enhancedWorkingStatusExtension(api: ExtensionAPI): void {
   const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
   let currentFrameIndex = 0;
