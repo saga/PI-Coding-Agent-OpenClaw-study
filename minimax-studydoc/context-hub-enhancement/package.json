@@ -1,0 +1,16 @@
+{
+  "name": "context-hub-enhancement",
+  "version": "1.0.0",
+  "description": "Context Hub 搜索增强 - BM25 + FTS5",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "build": "node src/build.js"
+  },
+  "keywords": ["context-hub", "bm25", "fts5", "search", "enhancement"],
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^9.4.0"
+  }
+}
