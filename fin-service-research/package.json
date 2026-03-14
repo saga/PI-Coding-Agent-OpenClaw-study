@@ -20,14 +20,16 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "sharp": "^0.34.5",
+    "ssim.js": "^3.5.0"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
-    "ts-node": "^10.9.0",
-    "typescript": "^5.0.0"
+    "@types/node": "^22.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.0.0"
   }
 }

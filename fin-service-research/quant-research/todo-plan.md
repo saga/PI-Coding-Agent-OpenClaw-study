@@ -127,56 +127,56 @@
 
 ### 4.1 行业趋势与前沿
 
-- [ ] **AI Agent 在量化投资中的应用**
+- [x] **AI Agent 在量化投资中的应用** → `quant-industry-trends.md`
   - 自主因子发现（Alpha-GPT 范式深化）
   - 多 Agent 协作研究框架
   - LLM 辅助代码生成（量化研究员的 Copilot）
 
-- [ ] **大模型金融微调（FinLLM）**
+- [x] **大模型金融微调（FinLLM）** → `quant-industry-trends.md`
   - BloombergGPT 分析
   - FinBERT 系列模型
   - 自建金融 LLM 的可行性评估
 
-- [ ] **量化 ESG 投资**
+- [x] **量化 ESG 投资** → `quant-industry-trends.md`
   - ESG 因子构建方法论
   - ESG 数据质量问题
   - ESG 与传统因子的融合策略
 
-- [ ] **加密资产量化研究**
+- [x] **加密资产量化研究** → `quant-industry-trends.md`
   - 链上数据（On-chain Data）作为另类因子
   - DeFi 协议数据
   - 加密市场微观结构
 
 ### 4.2 Fidelity International 专项
 
-- [ ] **Fidelity 量化研究现状调研**（已有初稿，需深化）
+- [x] **Fidelity 量化研究现状调研** → `quant-fidelity-specific.md`
   - 现有量化团队规模和能力
   - 已有系统和工具盘点
   - 与竞争对手的差距分析
 
-- [ ] **Fidelity 多资产量化策略**
+- [x] **Fidelity 多资产量化策略** → `quant-fidelity-specific.md`
   - 股票 + 固定收益 + 多资产的统一因子框架
   - 跨资产类别的风险模型
   - 目标日期基金的量化优化
 
-- [ ] **Fidelity 亚太市场量化挑战**
+- [x] **Fidelity 亚太市场量化挑战** → `quant-fidelity-specific.md`
   - 中国 A 股市场特殊性（涨跌停、T+1、退市制度）
   - 亚太数据质量和覆盖率问题
   - 多语言研究文档处理（中文、日文、韩文）
 
 ### 4.3 技术架构专题
 
-- [ ] **云原生量化平台架构**
+- [x] **云原生量化平台架构** → `quant-tech-architecture.md`
   - AWS/Azure 上的量化平台设计
   - 成本优化（Spot 实例用于回测）
   - 多云策略
 
-- [ ] **实时量化信号系统**
+- [x] **实时量化信号系统** → `quant-tech-architecture.md`
   - 低延迟架构设计
   - 流式因子计算
   - 实时风险监控
 
-- [ ] **量化平台安全与合规**
+- [x] **量化平台安全与合规** → `quant-tech-architecture.md`
   - 数据访问审计
   - 模型可解释性（监管要求）
   - 算法交易合规框架
