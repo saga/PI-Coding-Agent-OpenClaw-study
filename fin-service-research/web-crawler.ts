@@ -1,19 +1,13 @@
 /**
  * Web Crawler Base Module
  * 提供 MCP Chrome DevTools 客户端和基础爬虫功能
- * 支持 Chrome 内置 AI (Prompt API)
- * 
+ * 使用外部 LLM（Anthropic Claude）进行页面分析，不依赖 Chrome 内置 AI
+ *
  * 安装依赖:
  *   npm install @modelcontextprotocol/sdk sharp ssim.js
- * 
- * Chrome 内置 AI 配置:
- *   1. 访问 chrome://flags/#optimization-guide-on-device-model 设为 Enabled
- *   2. 访问 chrome://flags/#prompt-api-for-gemini-nano 设为 Enabled
- *   3. 重启 Chrome
- * 
- * 参考:
- *   https://developer.chrome.com/docs/ai/get-started
- *   https://developer.chrome.com/docs/ai/prompt-api
+ *
+ * 环境变量:
+ *   ANTHROPIC_API_KEY  - Anthropic Claude API Key（用于截图分析和挂起恢复）
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -82,24 +76,12 @@ export class MCPChromeDevToolsClient {
   async connect(clientName: string = 'web-crawler', useExistingChrome: boolean = true): Promise<void> {
     console.log('🔌 连接到 MCP Chrome DevTools...');
 
-    if (useExistingChrome) {
-      try {
-        this.transport = new StdioClientTransport({
-          command: "npx",
-          args: ["-y", "chrome-devtools-mcp@latest"]
-        });
-      } catch {
-        this.transport = new StdioClientTransport({
-          command: "npx",
-          args: ["-y", "chrome-devtools-mcp@latest", "--isolated"]
-        });
-      }
-    } else {
-      this.transport = new StdioClientTransport({
-        command: "npx",
-        args: ["-y", "chrome-devtools-mcp@latest", "--isolated"]
-      });
-    }
+    // 始终用 --isolated，避免与已有 Chrome profile 冲突
+    // useExistingChrome 保留参数签名兼容性，但不再影响行为
+    this.transport = new StdioClientTransport({
+      command: "npx",
+      args: ["-y", "chrome-devtools-mcp@latest", "--isolated"]
+    });
 
     this.client = new Client(
       { name: clientName, version: "1.0.0" },
@@ -107,17 +89,16 @@ export class MCPChromeDevToolsClient {
     );
 
     await this.client.connect(this.transport);
-    
+
     try {
       const listResult = await this.client.callTool({
         name: "list_pages",
         arguments: {}
       });
       const parsed = this.parseToolResult(listResult);
-      
       if (parsed && parsed.pages && parsed.pages.length > 0) {
         this.browserAlreadyRunning = true;
-        console.log(`✅ MCP 连接成功 (已连接到现有浏览器，${parsed.pages.length} 个页面)`);
+        console.log(`✅ MCP 连接成功 (${parsed.pages.length} 个页面)`);
       } else {
         console.log('✅ MCP 连接成功');
       }
@@ -149,8 +130,10 @@ export class MCPChromeDevToolsClient {
       name: "navigate_page",
       arguments: { type: "url", url }
     });
-    
-    return this.parseToolResult(result);
+
+    const parsed = this.parseToolResult(result);
+    if (this.isErrorResponse(parsed)) throw new Error(`navigatePage failed: ${parsed.message}`);
+    return parsed;
   }
 
   async waitFor(texts: string[], timeout: number = 15000): Promise<any> {
@@ -160,7 +143,7 @@ export class MCPChromeDevToolsClient {
       name: "wait_for",
       arguments: { text: texts, timeout }
     });
-    
+
     return this.parseToolResult(result);
   }
 
@@ -171,7 +154,7 @@ export class MCPChromeDevToolsClient {
       name: "take_snapshot",
       arguments: { verbose }
     });
-    
+
     return this.parseToolResult(result);
   }
 
@@ -182,8 +165,10 @@ export class MCPChromeDevToolsClient {
       name: "evaluate_script",
       arguments: { function: script }
     });
-    
-    return this.parseToolResult(result);
+
+    const parsed = this.parseToolResult(result);
+    if (this.isErrorResponse(parsed)) throw new Error(`evaluateScript failed: ${parsed.message}`);
+    return parsed;
   }
 
   async takeScreenshot(filePath?: string): Promise<Buffer | null> {
@@ -330,209 +315,31 @@ export class ChromeAIClient {
   }
 
   /**
-   * 检查 Chrome 内置 AI 可用性
+   * Chrome 内置 AI 已禁用。
+   * 脚本由 LLM 驱动执行，截图/错误信息直接输出给 LLM 判断，无需内置 AI。
    */
   async checkAvailability(): Promise<ChromeAIStatus> {
-    const script = `async () => {
-      if (!('LanguageModel' in self)) {
-        return { available: false, availability: 'unavailable', error: 'LanguageModel API not available' };
-      }
-      
-      try {
-        const availability = await LanguageModel.availability();
-        
-        if (availability === 'available') {
-          const params = await LanguageModel.params();
-          return { 
-            available: true, 
-            availability: 'available',
-            params: {
-              defaultTopK: params.defaultTopK,
-              maxTopK: params.maxTopK,
-              defaultTemperature: params.defaultTemperature,
-              maxTemperature: params.maxTemperature
-            }
-          };
-        }
-        
-        return { available: false, availability: availability };
-      } catch (e) {
-        return { available: false, availability: 'unavailable', error: e.message };
-      }
-    }`;
-
-    const result = await this.mcpClient.evaluateScript(script);
-    return result as ChromeAIStatus;
+    return { available: false, availability: 'unavailable', error: 'Chrome built-in AI disabled. Script is driven by external LLM.' };
   }
 
-  /**
-   * 发送 prompt 到 Chrome 内置 AI
-   */
-  async prompt(
-    message: string, 
-    options?: { 
-      topK?: number; 
-      temperature?: number;
-      systemPrompt?: string;
-    }
-  ): Promise<string> {
-    const script = `async () => {
-      const options = ${JSON.stringify(options || {})};
-      
-      try {
-        // 检查可用性
-        const availability = await LanguageModel.availability();
-        if (availability !== 'available') {
-          return JSON.stringify({ error: 'Model not available', availability });
-        }
-        
-        // 创建会话
-        const sessionOptions = {};
-        if (options.topK !== undefined) sessionOptions.topK = options.topK;
-        if (options.temperature !== undefined) sessionOptions.temperature = options.temperature;
-        if (options.systemPrompt) sessionOptions.systemPrompt = options.systemPrompt;
-        
-        const session = await LanguageModel.create(sessionOptions);
-        
-        // 发送 prompt
-        const response = await session.prompt(${JSON.stringify(message)});
-        
-        // 关闭会话
-        session.destroy();
-        
-        return JSON.stringify({ success: true, response });
-      } catch (e) {
-        return JSON.stringify({ error: e.message });
-      }
-    }()`;
-
-    const result = await this.mcpClient.evaluateScript(script);
-    
-    try {
-      const parsed = typeof result === 'string' ? JSON.parse(result) : result;
-      if (parsed.error) {
-        throw new Error(parsed.error);
-      }
-      return parsed.response;
-    } catch (e) {
-      throw new Error(`Chrome AI prompt failed: ${result}`);
-    }
+  async prompt(_message: string, _options?: any): Promise<string> {
+    throw new Error('[ChromeAI disabled] Use screenshot + external LLM to analyze page state.');
   }
 
-  /**
-   * 流式发送 prompt 到 Chrome 内置 AI
-   */
-  async promptStreaming(
-    message: string,
-    onChunk: (chunk: string) => void,
-    options?: {
-      topK?: number;
-      temperature?: number;
-      systemPrompt?: string;
-    }
-  ): Promise<string> {
-    const script = `async () => {
-      const options = ${JSON.stringify(options || {})};
-      
-      try {
-        const availability = await LanguageModel.availability();
-        if (availability !== 'available') {
-          return JSON.stringify({ error: 'Model not available', availability });
-        }
-        
-        const sessionOptions = {};
-        if (options.topK !== undefined) sessionOptions.topK = options.topK;
-        if (options.temperature !== undefined) sessionOptions.temperature = options.temperature;
-        if (options.systemPrompt) sessionOptions.systemPrompt = options.systemPrompt;
-        
-        const session = await LanguageModel.create(sessionOptions);
-        
-        // 流式响应
-        const stream = await session.promptStreaming(${JSON.stringify(message)});
-        let fullResponse = '';
-        
-        for await (const chunk of stream) {
-          fullResponse += chunk;
-        }
-        
-        session.destroy();
-        
-        return JSON.stringify({ success: true, response: fullResponse });
-      } catch (e) {
-        return JSON.stringify({ error: e.message });
-      }
-    }()`;
-
-    const result = await this.mcpClient.evaluateScript(script);
-    
-    try {
-      const parsed = typeof result === 'string' ? JSON.parse(result) : result;
-      if (parsed.error) {
-        throw new Error(parsed.error);
-      }
-      return parsed.response;
-    } catch (e) {
-      throw new Error(`Chrome AI streaming prompt failed: ${result}`);
-    }
+  async promptStreaming(_message: string, _onChunk: (chunk: string) => void, _options?: any): Promise<string> {
+    throw new Error('[ChromeAI disabled] Use screenshot + external LLM to analyze page state.');
   }
 
-  /**
-   * 分析截图变化原因（使用 AI）
-   */
-  async analyzeScreenshotChange(
-    preActionDescription: string,
-    postActionDescription: string,
-    expectedChange: string
-  ): Promise<string> {
-    const prompt = `You are analyzing web page screenshots to detect changes.
-
-Before action: ${preActionDescription}
-After action: ${postActionDescription}
-Expected change: ${expectedChange}
-
-Please analyze:
-1. Did the expected change occur?
-2. If not, what might be the reason?
-3. What should be done to achieve the expected change?
-
-Provide a concise analysis in Chinese.`;
-
-    return this.prompt(prompt, {
-      systemPrompt: 'You are a web automation expert analyzing page changes.',
-      temperature: 0.3
-    });
+  async analyzeScreenshotChange(_pre: string, _post: string, _expected: string): Promise<string> {
+    return '[ChromeAI disabled] Screenshot saved to disk. LLM should inspect the file and decide next action.';
   }
 
-  /**
-   * 提取页面内容摘要
-   */
-  async summarizeContent(content: string, maxLength: number = 500): Promise<string> {
-    const prompt = `Please summarize the following web content in Chinese (max ${maxLength} characters):
-
-${content.substring(0, 3000)}
-
-Summary:`;
-
-    return this.prompt(prompt, {
-      systemPrompt: 'You are a content summarizer. Provide concise summaries in Chinese.',
-      temperature: 0.5
-    });
+  async summarizeContent(_content: string, _maxLength?: number): Promise<string> {
+    return '[ChromeAI disabled] Pass content directly to external LLM for summarization.';
   }
 
-  /**
-   * 分类内容
-   */
-  async classifyContent(content: string, categories: string[]): Promise<string> {
-    const prompt = `Classify the following content into one of these categories: ${categories.join(', ')}
-
-Content: ${content.substring(0, 1000)}
-
-Category:`;
-
-    return this.prompt(prompt, {
-      systemPrompt: 'You are a content classifier. Return only the category name.',
-      temperature: 0.1
-    });
+  async classifyContent(_content: string, _categories: string[]): Promise<string> {
+    return '[ChromeAI disabled] Pass content directly to external LLM for classification.';
   }
 }
 
@@ -572,6 +379,38 @@ export abstract class BaseWebCrawler<T extends CrawlResult, P extends PageConfig
 
   protected delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * 带超时的操作 wrapper。
+   * 超过 timeoutMs（默认60秒）未完成，自动截图保存到磁盘，
+   * 然后抛出错误（含截图路径），由驱动 LLM 查看截图决定下一步。
+   */
+  protected async withTimeout<T>(
+    label: string,
+    fn: () => Promise<T>,
+    timeoutMs: number = 60000
+  ): Promise<T> {
+    const ts = Date.now();
+    const screenshotPath = path.join(
+      this.screenshotDir,
+      `timeout-${label.replace(/[^a-z0-9]+/gi, '-')}-${ts}.png`
+    );
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(async () => {
+        try {
+          const buf = await this.mcpClient.takeScreenshot();
+          if (buf) fs.writeFileSync(screenshotPath, buf);
+        } catch {}
+        reject(new Error(
+          `[TIMEOUT] "${label}" 超过 ${timeoutMs/1000}s 未完成。` +
+          `截图已保存: ${screenshotPath} — LLM 请查看截图判断页面状态并决定下一步`
+        ));
+      }, timeoutMs)
+    );
+
+    return Promise.race([fn(), timeoutPromise]);
   }
 
   protected formatDate(date: Date): string {
@@ -657,6 +496,48 @@ export abstract class BaseWebCrawler<T extends CrawlResult, P extends PageConfig
    */
   async summarizeWithAI(content: string): Promise<string> {
     return this.aiClient.summarizeContent(content);
+  }
+
+  /**
+   * 截图检查页面状态，打印截图路径 + 页面文字摘要 + 期望状态描述。
+   * 如果 throwOnAbnormal=true，则抛出异常暂停执行，等待 LLM 分析后决定下一步。
+   *
+   * @param description 当前正在做什么
+   * @param expectedState 期望页面应该是什么状态（LLM 用来判断是否正常）
+   * @param throwOnAbnormal 是否在截图后抛出异常暂停（默认 true）
+   */
+  async checkPageState(description: string, expectedState?: string, throwOnAbnormal: boolean = true): Promise<void> {
+    const ts = Date.now();
+    const label = description.replace(/[^a-z0-9]+/gi, '-').substring(0, 40);
+    const screenshotPath = path.join(this.screenshotDir, `check-${label}-${ts}.png`);
+
+    // 截图
+    try {
+      const buf = await this.mcpClient.takeScreenshot();
+      if (buf) fs.writeFileSync(screenshotPath, buf);
+    } catch {}
+
+    // 抓页面文字摘要（前600字）
+    let pageText = '';
+    try {
+      pageText = await this.mcpClient.evaluateScript('() => document.body.innerText.substring(0, 600)') || '';
+    } catch {}
+
+    console.log(`\n${'='.repeat(60)}`);
+    console.log(`📸 [PAGE CHECK] ${description}`);
+    console.log(`   截图路径: ${screenshotPath}`);
+    if (expectedState) {
+      console.log(`   期望状态: ${expectedState}`);
+    }
+    console.log(`   页面文字摘要:\n${pageText}`);
+    console.log(`${'='.repeat(60)}\n`);
+
+    if (throwOnAbnormal) {
+      throw new Error(
+        `[PAGE CHECK PAUSE] "${description}" — LLM 请查看截图和页面文字，` +
+        `判断是否符合期望状态"${expectedState || '未指定'}"，然后决定下一步操作`
+      );
+    }
   }
 
   abstract crawlAll(): Promise<T[]>;
