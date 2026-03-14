@@ -28,6 +28,8 @@ pnpm-debug.log*
 *.tsbuildinfo
 /.tsbuildinfo
 
+node_modules/
+
 # IDE
 .vscode/
 .idea/

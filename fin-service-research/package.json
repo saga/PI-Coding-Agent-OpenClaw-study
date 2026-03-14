@@ -1,0 +1,33 @@
+{
+  "name": "fidelity-insights-crawler",
+  "version": "1.0.0",
+  "description": "爬取 Fidelity International 网站的研究洞察内容",
+  "main": "fidelity-insights-crawler.ts",
+  "scripts": {
+    "crawl": "ts-node fidelity-insights-crawler.ts",
+    "crawl:equities": "ts-node -e \"const {FidelityInsightsCrawler} = require('./fidelity-insights-crawler'); const c = new FidelityInsightsCrawler(); c.crawlPage({url: 'https://professionals.fidelity.co.uk/solutions/equities', name: 'equities', insightSection: 'Our latest equities insights', waitForTexts: ['Our latest equities insights', 'Equities']}).then(console.log)\"",
+    "build": "tsc",
+    "start": "node dist/fidelity-insights-crawler.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "fidelity",
+    "crawler",
+    "mcp",
+    "chrome-devtools",
+    "insights"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
