@@ -1,0 +1,8 @@
+snowflake-connector-python>=3.6.0
+pyodbc>=5.0.0
+requests>=2.31.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
+openlineage-python>=1.18.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
