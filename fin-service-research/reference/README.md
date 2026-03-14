@@ -29,6 +29,17 @@
 
 ---
 
+## Fidelity 官方框架文档
+
+| 文件 | 标题 | 来源 | 主题 |
+|------|------|------|------|
+| [fidelity-co-uk-sustainable-esg-investing.md](./fidelity-co-uk-sustainable-esg-investing.md) | Sustainable and ESG Investing (UK) | fidelity.co.uk | UK SDR 四个标签定义，Fidelity 已采用标签的基金列表 |
+| [fidelity-fsif-sustainable-investing-framework.md](./fidelity-fsif-sustainable-investing-framework.md) | Fidelity Sustainable Investing Framework (FSIF) | fidelityinternational.com | FSIF 三层框架完整内容，排除框架，监管对齐，所有相关文档链接 |
+| [fidelity-sustainable-investing-principles-pdf.md](./fidelity-sustainable-investing-principles-pdf.md) | Sustainable Investing Principles (PDF) | fidelityinternational.com/PDF | ESG 2.0、双重重要性、参与优先于排除、专有评级系统、气候承诺 |
+| [fidelity-fsif-supplementary-information-pdf.md](./fidelity-fsif-supplementary-information-pdf.md) | Supplementary Information About FSIF (PDF) | fidelityinternational.com/PDF | ESG Tilt/Target 方法论细节、PAI 指标、EU Taxonomy 对齐、SDR/SFDR 映射、市场适配 |
+
+---
+
 ## 关键交叉点
 
 - **Fidelity × WeeFin 直接关联**：`weefin-sdr-sfdr-its-match.md` 中引用了 Fidelity 的 Mark Spooner（Sustainable Investing Associate）对 SDR/SFDR 的观点
