@@ -165,10 +165,11 @@ class FidelitySICrawler extends BaseWebCrawler<SICrawlResult, any> {
     // 每次导航后处理弹窗
     await this.withTimeout('handle-popups', () => this.handlePopups());
 
-    // 截图暂停，让 LLM 判断搜索结果页状态是否正常
+    // 截图记录搜索结果页状态，不暂停
     await this.checkPageState(
       `搜索 "${query}" 后的页面状态`,
-      `搜索结果页应显示文章列表，不应有任何弹窗遮挡。如果有弹窗，说明 handlePopups 没有成功关闭它`
+      `搜索结果页应显示文章列表，不应有任何弹窗遮挡。如果有弹窗，说明 handlePopups 没有成功关闭它`,
+      false
     );
 
     // LLM 确认页面正常后，提取链接
@@ -242,7 +243,8 @@ class FidelitySICrawler extends BaseWebCrawler<SICrawlResult, any> {
       if ((i + 1) % 5 === 0) {
         await this.checkPageState(
           `Phase 2 已抓取 ${i + 1}/${links.length} 篇，最后: ${link.title.substring(0, 40)}`,
-          `应显示文章正文内容，不应有弹窗遮挡，body 长度 ${body.length} 字符`
+          `应显示文章正文内容，不应有弹窗遮挡，body 长度 ${body.length} 字符`,
+          false
         );
       }
       } catch (err) {
@@ -264,76 +266,53 @@ class FidelitySICrawler extends BaseWebCrawler<SICrawlResult, any> {
    * 3. 通用投资者类型弹窗（其他格式）
    */
   private async handlePopups(): Promise<void> {
-    // 先截图，打印页面文字，确认弹窗状态
-    await this.checkPageState('handlePopups 开始，检查弹窗状态', '页面应该有弹窗或正常内容，如果有"Confirm your client category"弹窗属于正常，等待处理');
+      // 先截图，打印页面文字，仅记录不暂停
+      await this.checkPageState('handlePopups 开始，检查弹窗状态', '页面应该有弹窗或正常内容，如果有"Confirm your client category"弹窗属于正常，等待处理', false);
 
-    // 1. "Confirm your client category" 弹窗（fidelity.lu 特有）
-    const r0 = await this.getMcpClient().evaluateScript(`() => {
-      // 找包含 "Confirm your client category" 的弹窗容器
-      const allText = document.body.innerText;
-      if (!allText.includes('Confirm your client category') && !allText.includes('client category')) {
-        return 'No client category popup found';
-      }
-      // 在弹窗内找 Institutional / Professional 按钮
-      const candidates = Array.from(document.querySelectorAll('a,button,li,[role="button"]'));
-      for (const el of candidates) {
-        const t = (el.innerText || el.textContent || '').trim();
-        if (t === 'Institutional Investors' || t === 'Professional Investors' ||
-            t.includes('Institutional') || t.includes('Professional')) {
-          const htmlEl = el as HTMLElement;
-          htmlEl.click();
-          return 'Clicked client category: ' + t;
+      // 1. 投资者类型选择（整页或弹窗形式）
+      // 按钮文字: "I am a professional client" (class: js-professional-investor)
+      const r0 = await this.getMcpClient().evaluateScript(`() => {
+        var candidates = Array.from(document.querySelectorAll('a,button,li,[role="button"]'));
+        for (var i = 0; i < candidates.length; i++) {
+          var el = candidates[i];
+          var t = (el.innerText || el.textContent || '').trim();
+          var cls = (el.className || '').toString();
+          if (cls.includes('js-professional-investor') ||
+              t === 'I am a professional client' ||
+              t === 'Institutional Investors' || t === 'Professional Investors' ||
+              t === 'Investment Professionals') {
+            el.click();
+            return 'Clicked: ' + t;
+          }
         }
-      }
-      // 找 Confirm / Continue / OK 按钮
-      for (const el of candidates) {
-        const t = (el.innerText || el.textContent || '').trim().toLowerCase();
-        if (t === 'confirm' || t === 'continue' || t === 'ok' || t === 'proceed') {
-          const htmlEl = el as HTMLElement;
-          htmlEl.click();
-          return 'Clicked confirm button: ' + t;
-        }
-      }
-      return 'Client category popup found but no button clicked';
-    }`);
-    console.log(`   客户类型弹窗: ${r0}`);
-    await this.delay(2500);
+        return 'Not found';
+      }`);
+      console.log(`   投资者类型: ${r0}`);
+      await this.delay(3000);
 
-    // 2. 通用投资者类型弹窗（Institutional Investors / Professional）
-    const r1 = await this.getMcpClient().evaluateScript(`() => {
-      for (const el of document.querySelectorAll('a,button,[role="button"]')) {
-        const t = (el.innerText || el.textContent || '').trim();
-        if (t === 'Institutional Investors' || t === 'Professional Investors' ||
-            t.includes('Institutional') || t.includes('Professional')) {
-          const htmlEl = el as HTMLElement;
-          if (htmlEl.offsetParent !== null) { htmlEl.click(); return 'Clicked: ' + t; }
+      // 2. Cookie 弹窗
+      const r1 = await this.getMcpClient().evaluateScript(`() => {
+        var selectors = ['#onetrust-accept-btn-handler','button[id*="accept"]','button[class*="accept"]'];
+        for (var i = 0; i < selectors.length; i++) {
+          var btn = document.querySelector(selectors[i]);
+          if (btn && btn.offsetParent !== null) { btn.click(); return 'Clicked: ' + selectors[i]; }
         }
-      }
-      return 'Not found';
-    }`);
-    console.log(`   投资者弹窗: ${r1}`);
-    await this.delay(2000);
-
-    // 3. Cookie 弹窗
-    const r2 = await this.getMcpClient().evaluateScript(`() => {
-      for (const sel of ['#onetrust-accept-btn-handler','button[id*="accept"]','button[class*="accept"]']) {
-        const btn = document.querySelector(sel) as HTMLElement | null;
-        if (btn && btn.offsetParent !== null) { btn.click(); return 'Clicked: ' + sel; }
-      }
-      for (const btn of document.querySelectorAll('button,a')) {
-        const t = ((btn as HTMLElement).innerText || '').toLowerCase();
-        if ((t.includes('accept all') || t.includes('accept cookies')) && (btn as HTMLElement).offsetParent !== null) {
-          (btn as HTMLElement).click(); return 'Clicked: ' + t;
+        var btns = document.querySelectorAll('button,a');
+        for (var j = 0; j < btns.length; j++) {
+          var t = (btns[j].innerText || '').toLowerCase();
+          if ((t.includes('accept all') || t.includes('accept cookies')) && btns[j].offsetParent !== null) {
+            btns[j].click(); return 'Clicked: ' + t;
+          }
         }
-      }
-      return 'Not found';
-    }`);
-    console.log(`   Cookie 弹窗: ${r2}`);
-    await this.delay(1500);
+        return 'Not found';
+      }`);
+      console.log(`   Cookie 弹窗: ${r1}`);
+      await this.delay(1500);
 
-    // 弹窗处理完成后截图确认
-    await this.checkPageState('handlePopups 完成，确认弹窗已关闭', '弹窗应该已关闭，页面显示正常内容（文章列表或专题页），不应有任何遮挡弹窗');
-  }
+      // 弹窗处理完成后截图确认，暂停让 LLM 判断
+      await this.checkPageState('handlePopups 完成，确认弹窗已关闭', '弹窗应该已关闭，页面显示正常内容（文章列表或专题页），不应有任何遮挡弹窗');
+    }
+
 
   // ── 去重 ─────────────────────────────────────────────────────
 

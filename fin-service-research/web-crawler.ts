@@ -354,6 +354,8 @@ export abstract class BaseWebCrawler<T extends CrawlResult, P extends PageConfig
   protected outputDir: string;
   protected screenshotDir: string;
 
+  protected lastScreenshot: Buffer | null = null;
+
   constructor(outputDir: string = './crawl-results') {
     this.mcpClient = new MCPChromeDevToolsClient();
     this.aiClient = new ChromeAIClient(this.mcpClient);
@@ -499,23 +501,37 @@ export abstract class BaseWebCrawler<T extends CrawlResult, P extends PageConfig
   }
 
   /**
-   * 截图检查页面状态，打印截图路径 + 页面文字摘要 + 期望状态描述。
-   * 如果 throwOnAbnormal=true，则抛出异常暂停执行，等待 LLM 分析后决定下一步。
-   *
-   * @param description 当前正在做什么
-   * @param expectedState 期望页面应该是什么状态（LLM 用来判断是否正常）
-   * @param throwOnAbnormal 是否在截图后抛出异常暂停（默认 true）
+   * 截图检查页面状态。
+   * 流程：
+   *   1. 截图，与上次截图用 SSIM 比较是否有变化
+   *   2. 抓页面文字摘要
+   *   3. 打印固定 prompt 供 LLM 回答：
+   *      - 当前页面是否 404 / Not Found？
+   *      - 当前页面是否有弹出窗口？
+   *      - 如果 SSIM 显示无变化，额外问：没有变化是否正常？
+   *   4. throwOnAbnormal=true 时抛出异常暂停，等 LLM 决定下一步
    */
-  async checkPageState(description: string, expectedState?: string, throwOnAbnormal: boolean = true): Promise<void> {
+  async checkPageState(description: string, expectedState?: string, throwOnAbnormal: boolean = false): Promise<void> {
     const ts = Date.now();
     const label = description.replace(/[^a-z0-9]+/gi, '-').substring(0, 40);
     const screenshotPath = path.join(this.screenshotDir, `check-${label}-${ts}.png`);
 
     // 截图
+    let currentScreenshot: Buffer | null = null;
     try {
-      const buf = await this.mcpClient.takeScreenshot();
-      if (buf) fs.writeFileSync(screenshotPath, buf);
+      currentScreenshot = await this.mcpClient.takeScreenshot();
+      if (currentScreenshot) fs.writeFileSync(screenshotPath, currentScreenshot);
     } catch {}
+
+    // SSIM 比较与上次截图
+    let ssimResult: { changed: boolean; similarity: number } = { changed: true, similarity: 1 };
+    if (this.lastScreenshot && currentScreenshot) {
+      ssimResult = await ImageComparator.compareBuffers(this.lastScreenshot, currentScreenshot);
+    }
+    const noChange = !ssimResult.changed;
+
+    // 更新上次截图
+    if (currentScreenshot) this.lastScreenshot = currentScreenshot;
 
     // 抓页面文字摘要（前600字）
     let pageText = '';
@@ -523,19 +539,31 @@ export abstract class BaseWebCrawler<T extends CrawlResult, P extends PageConfig
       pageText = await this.mcpClient.evaluateScript('() => document.body.innerText.substring(0, 600)') || '';
     } catch {}
 
+    // 构建固定 prompt
+    const ssimInfo = this.lastScreenshot && currentScreenshot
+      ? `SSIM相似度: ${(ssimResult.similarity * 100).toFixed(1)}% — 页面${noChange ? '【无变化】' : '【有变化】'}`
+      : 'SSIM: 无上次截图可比较';
+
     console.log(`\n${'='.repeat(60)}`);
     console.log(`📸 [PAGE CHECK] ${description}`);
     console.log(`   截图路径: ${screenshotPath}`);
-    if (expectedState) {
-      console.log(`   期望状态: ${expectedState}`);
-    }
+    if (expectedState) console.log(`   期望状态: ${expectedState}`);
+    console.log(`   ${ssimInfo}`);
     console.log(`   页面文字摘要:\n${pageText}`);
+    console.log(`\n--- LLM 请回答以下问题 ---`);
+    console.log(`Q1: 当前页面是否是 404 / Not Found / 无搜索结果 页面？`);
+    console.log(`Q2: 当前页面是否有弹出窗口（popup/modal/overlay）遮挡内容？`);
+    if (noChange) {
+      console.log(`Q3: [SSIM 显示页面无变化] 在"${description}"操作后页面没有变化，这是正常的吗？如果不正常，可能的原因是什么？`);
+    }
     console.log(`${'='.repeat(60)}\n`);
 
     if (throwOnAbnormal) {
       throw new Error(
-        `[PAGE CHECK PAUSE] "${description}" — LLM 请查看截图和页面文字，` +
-        `判断是否符合期望状态"${expectedState || '未指定'}"，然后决定下一步操作`
+        `[PAGE CHECK PAUSE] "${description}" — ` +
+        `截图: ${screenshotPath} | ${ssimInfo} | ` +
+        `LLM 请回答: Q1=是否404? Q2=是否有弹窗? ${noChange ? 'Q3=无变化是否正常?' : ''} ` +
+        `然后决定下一步操作`
       );
     }
   }
