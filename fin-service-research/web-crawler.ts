@@ -1,9 +1,19 @@
 /**
  * Web Crawler Base Module
  * 提供 MCP Chrome DevTools 客户端和基础爬虫功能
+ * 支持 Chrome 内置 AI (Prompt API)
  * 
  * 安装依赖:
  *   npm install @modelcontextprotocol/sdk sharp ssim.js
+ * 
+ * Chrome 内置 AI 配置:
+ *   1. 访问 chrome://flags/#optimization-guide-on-device-model 设为 Enabled
+ *   2. 访问 chrome://flags/#prompt-api-for-gemini-nano 设为 Enabled
+ *   3. 重启 Chrome
+ * 
+ * 参考:
+ *   https://developer.chrome.com/docs/ai/get-started
+ *   https://developer.chrome.com/docs/ai/prompt-api
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -37,6 +47,28 @@ export interface ScreenshotComparison {
   analysis?: string;
 }
 
+export type LanguageModelAvailability = 'unavailable' | 'downloadable' | 'downloading' | 'available';
+
+export interface LanguageModelParams {
+  defaultTopK: number;
+  maxTopK: number;
+  defaultTemperature: number;
+  maxTemperature: number;
+}
+
+export interface ChromeAIStatus {
+  available: boolean;
+  availability: LanguageModelAvailability;
+  params?: LanguageModelParams;
+  error?: string;
+}
+
+export interface MCPConfig {
+  command?: string;
+  args?: string[];
+  chromeUrl?: string;
+}
+
 // ============================================================================
 // MCP Chrome DevTools 客户端
 // ============================================================================
@@ -45,14 +77,29 @@ export class MCPChromeDevToolsClient {
   private client: Client | null = null;
   private transport: StdioClientTransport | null = null;
   private browserAlreadyRunning: boolean = false;
+  private config: MCPConfig = {};
 
-  async connect(clientName: string = 'web-crawler'): Promise<void> {
+  async connect(clientName: string = 'web-crawler', useExistingChrome: boolean = true): Promise<void> {
     console.log('🔌 连接到 MCP Chrome DevTools...');
 
-    this.transport = new StdioClientTransport({
-      command: "npx",
-      args: ["-y", "chrome-devtools-mcp@latest", "--isolated"]
-    });
+    if (useExistingChrome) {
+      try {
+        this.transport = new StdioClientTransport({
+          command: "npx",
+          args: ["-y", "chrome-devtools-mcp@latest"]
+        });
+      } catch {
+        this.transport = new StdioClientTransport({
+          command: "npx",
+          args: ["-y", "chrome-devtools-mcp@latest", "--isolated"]
+        });
+      }
+    } else {
+      this.transport = new StdioClientTransport({
+        command: "npx",
+        args: ["-y", "chrome-devtools-mcp@latest", "--isolated"]
+      });
+    }
 
     this.client = new Client(
       { name: clientName, version: "1.0.0" },
@@ -271,17 +318,238 @@ export class ImageComparator {
 }
 
 // ============================================================================
+// Chrome 内置 AI 客户端 (Prompt API)
+// ============================================================================
+
+export class ChromeAIClient {
+  private mcpClient: MCPChromeDevToolsClient;
+  private sessionCreated: boolean = false;
+
+  constructor(mcpClient: MCPChromeDevToolsClient) {
+    this.mcpClient = mcpClient;
+  }
+
+  /**
+   * 检查 Chrome 内置 AI 可用性
+   */
+  async checkAvailability(): Promise<ChromeAIStatus> {
+    const script = `async () => {
+      if (!('LanguageModel' in self)) {
+        return { available: false, availability: 'unavailable', error: 'LanguageModel API not available' };
+      }
+      
+      try {
+        const availability = await LanguageModel.availability();
+        
+        if (availability === 'available') {
+          const params = await LanguageModel.params();
+          return { 
+            available: true, 
+            availability: 'available',
+            params: {
+              defaultTopK: params.defaultTopK,
+              maxTopK: params.maxTopK,
+              defaultTemperature: params.defaultTemperature,
+              maxTemperature: params.maxTemperature
+            }
+          };
+        }
+        
+        return { available: false, availability: availability };
+      } catch (e) {
+        return { available: false, availability: 'unavailable', error: e.message };
+      }
+    }`;
+
+    const result = await this.mcpClient.evaluateScript(script);
+    return result as ChromeAIStatus;
+  }
+
+  /**
+   * 发送 prompt 到 Chrome 内置 AI
+   */
+  async prompt(
+    message: string, 
+    options?: { 
+      topK?: number; 
+      temperature?: number;
+      systemPrompt?: string;
+    }
+  ): Promise<string> {
+    const script = `async () => {
+      const options = ${JSON.stringify(options || {})};
+      
+      try {
+        // 检查可用性
+        const availability = await LanguageModel.availability();
+        if (availability !== 'available') {
+          return JSON.stringify({ error: 'Model not available', availability });
+        }
+        
+        // 创建会话
+        const sessionOptions = {};
+        if (options.topK !== undefined) sessionOptions.topK = options.topK;
+        if (options.temperature !== undefined) sessionOptions.temperature = options.temperature;
+        if (options.systemPrompt) sessionOptions.systemPrompt = options.systemPrompt;
+        
+        const session = await LanguageModel.create(sessionOptions);
+        
+        // 发送 prompt
+        const response = await session.prompt(${JSON.stringify(message)});
+        
+        // 关闭会话
+        session.destroy();
+        
+        return JSON.stringify({ success: true, response });
+      } catch (e) {
+        return JSON.stringify({ error: e.message });
+      }
+    }()`;
+
+    const result = await this.mcpClient.evaluateScript(script);
+    
+    try {
+      const parsed = typeof result === 'string' ? JSON.parse(result) : result;
+      if (parsed.error) {
+        throw new Error(parsed.error);
+      }
+      return parsed.response;
+    } catch (e) {
+      throw new Error(`Chrome AI prompt failed: ${result}`);
+    }
+  }
+
+  /**
+   * 流式发送 prompt 到 Chrome 内置 AI
+   */
+  async promptStreaming(
+    message: string,
+    onChunk: (chunk: string) => void,
+    options?: {
+      topK?: number;
+      temperature?: number;
+      systemPrompt?: string;
+    }
+  ): Promise<string> {
+    const script = `async () => {
+      const options = ${JSON.stringify(options || {})};
+      
+      try {
+        const availability = await LanguageModel.availability();
+        if (availability !== 'available') {
+          return JSON.stringify({ error: 'Model not available', availability });
+        }
+        
+        const sessionOptions = {};
+        if (options.topK !== undefined) sessionOptions.topK = options.topK;
+        if (options.temperature !== undefined) sessionOptions.temperature = options.temperature;
+        if (options.systemPrompt) sessionOptions.systemPrompt = options.systemPrompt;
+        
+        const session = await LanguageModel.create(sessionOptions);
+        
+        // 流式响应
+        const stream = await session.promptStreaming(${JSON.stringify(message)});
+        let fullResponse = '';
+        
+        for await (const chunk of stream) {
+          fullResponse += chunk;
+        }
+        
+        session.destroy();
+        
+        return JSON.stringify({ success: true, response: fullResponse });
+      } catch (e) {
+        return JSON.stringify({ error: e.message });
+      }
+    }()`;
+
+    const result = await this.mcpClient.evaluateScript(script);
+    
+    try {
+      const parsed = typeof result === 'string' ? JSON.parse(result) : result;
+      if (parsed.error) {
+        throw new Error(parsed.error);
+      }
+      return parsed.response;
+    } catch (e) {
+      throw new Error(`Chrome AI streaming prompt failed: ${result}`);
+    }
+  }
+
+  /**
+   * 分析截图变化原因（使用 AI）
+   */
+  async analyzeScreenshotChange(
+    preActionDescription: string,
+    postActionDescription: string,
+    expectedChange: string
+  ): Promise<string> {
+    const prompt = `You are analyzing web page screenshots to detect changes.
+
+Before action: ${preActionDescription}
+After action: ${postActionDescription}
+Expected change: ${expectedChange}
+
+Please analyze:
+1. Did the expected change occur?
+2. If not, what might be the reason?
+3. What should be done to achieve the expected change?
+
+Provide a concise analysis in Chinese.`;
+
+    return this.prompt(prompt, {
+      systemPrompt: 'You are a web automation expert analyzing page changes.',
+      temperature: 0.3
+    });
+  }
+
+  /**
+   * 提取页面内容摘要
+   */
+  async summarizeContent(content: string, maxLength: number = 500): Promise<string> {
+    const prompt = `Please summarize the following web content in Chinese (max ${maxLength} characters):
+
+${content.substring(0, 3000)}
+
+Summary:`;
+
+    return this.prompt(prompt, {
+      systemPrompt: 'You are a content summarizer. Provide concise summaries in Chinese.',
+      temperature: 0.5
+    });
+  }
+
+  /**
+   * 分类内容
+   */
+  async classifyContent(content: string, categories: string[]): Promise<string> {
+    const prompt = `Classify the following content into one of these categories: ${categories.join(', ')}
+
+Content: ${content.substring(0, 1000)}
+
+Category:`;
+
+    return this.prompt(prompt, {
+      systemPrompt: 'You are a content classifier. Return only the category name.',
+      temperature: 0.1
+    });
+  }
+}
+
+// ============================================================================
 // 基础爬虫类
 // ============================================================================
 
 export abstract class BaseWebCrawler<T extends CrawlResult, P extends PageConfig> {
   protected results: T[] = [];
   protected mcpClient: MCPChromeDevToolsClient;
+  protected aiClient: ChromeAIClient;
   protected outputDir: string;
   protected screenshotDir: string;
 
   constructor(outputDir: string = './crawl-results') {
     this.mcpClient = new MCPChromeDevToolsClient();
+    this.aiClient = new ChromeAIClient(this.mcpClient);
     this.outputDir = outputDir;
     
     if (!fs.existsSync(outputDir)) {
@@ -298,6 +566,10 @@ export abstract class BaseWebCrawler<T extends CrawlResult, P extends PageConfig
     return this.mcpClient;
   }
 
+  getAiClient(): ChromeAIClient {
+    return this.aiClient;
+  }
+
   protected delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
@@ -309,7 +581,8 @@ export abstract class BaseWebCrawler<T extends CrawlResult, P extends PageConfig
   async compareScreenshots(
     actionName: string,
     action: () => Promise<any>,
-    pageName: string
+    pageName: string,
+    expectedChange?: string
   ): Promise<ScreenshotComparison> {
     const timestamp = Date.now();
     const safeName = actionName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
@@ -344,7 +617,24 @@ export abstract class BaseWebCrawler<T extends CrawlResult, P extends PageConfig
 
     if (!changed && preScreenshot && postScreenshot) {
       console.log(`     ⚠️ 页面没有变化，保存截图用于分析`);
-      result.analysis = `截图已保存，页面在 "${actionName}" 操作后没有变化，可能需要人工检查。`;
+      
+      // 尝试使用 AI 分析原因
+      if (expectedChange) {
+        try {
+          const aiAnalysis = await this.aiClient.analyzeScreenshotChange(
+            `Screenshot saved at ${prePath}`,
+            `Screenshot saved at ${postPath}`,
+            expectedChange
+          );
+          result.analysis = aiAnalysis;
+          console.log(`     🤖 AI 分析: ${aiAnalysis.substring(0, 200)}...`);
+        } catch (error) {
+          result.analysis = `截图已保存，页面在 "${actionName}" 操作后没有变化，可能需要人工检查。`;
+          console.log(`     ⚠️ AI 分析不可用: ${error}`);
+        }
+      } else {
+        result.analysis = `截图已保存，页面在 "${actionName}" 操作后没有变化，可能需要人工检查。`;
+      }
     } else if (changed) {
       console.log(`     ✅ 页面已变化`);
       if (fs.existsSync(prePath)) {
@@ -353,6 +643,20 @@ export abstract class BaseWebCrawler<T extends CrawlResult, P extends PageConfig
     }
 
     return result;
+  }
+
+  /**
+   * 检查 Chrome 内置 AI 是否可用
+   */
+  async checkAIAvailability(): Promise<ChromeAIStatus> {
+    return this.aiClient.checkAvailability();
+  }
+
+  /**
+   * 使用 AI 提取内容摘要
+   */
+  async summarizeWithAI(content: string): Promise<string> {
+    return this.aiClient.summarizeContent(content);
   }
 
   abstract crawlAll(): Promise<T[]>;
