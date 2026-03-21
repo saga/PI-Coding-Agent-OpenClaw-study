@@ -265,53 +265,15 @@ class FidelitySICrawler extends BaseWebCrawler<SICrawlResult, any> {
    * 2. Cookie 同意弹窗 — 点击 Accept All
    * 3. 通用投资者类型弹窗（其他格式）
    */
+  /** 处理弹窗：复用基类默认实现（投资者类型 + cookie） */
   private async handlePopups(): Promise<void> {
-      // 先截图，打印页面文字，仅记录不暂停
-      await this.checkPageState('handlePopups 开始，检查弹窗状态', '页面应该有弹窗或正常内容，如果有"Confirm your client category"弹窗属于正常，等待处理', false);
-
-      // 1. 投资者类型选择（整页或弹窗形式）
-      // 按钮文字: "I am a professional client" (class: js-professional-investor)
-      const r0 = await this.getMcpClient().evaluateScript(`() => {
-        var candidates = Array.from(document.querySelectorAll('a,button,li,[role="button"]'));
-        for (var i = 0; i < candidates.length; i++) {
-          var el = candidates[i];
-          var t = (el.innerText || el.textContent || '').trim();
-          var cls = (el.className || '').toString();
-          if (cls.includes('js-professional-investor') ||
-              t === 'I am a professional client' ||
-              t === 'Institutional Investors' || t === 'Professional Investors' ||
-              t === 'Investment Professionals') {
-            el.click();
-            return 'Clicked: ' + t;
-          }
-        }
-        return 'Not found';
-      }`);
-      console.log(`   投资者类型: ${r0}`);
-      await this.delay(3000);
-
-      // 2. Cookie 弹窗
-      const r1 = await this.getMcpClient().evaluateScript(`() => {
-        var selectors = ['#onetrust-accept-btn-handler','button[id*="accept"]','button[class*="accept"]'];
-        for (var i = 0; i < selectors.length; i++) {
-          var btn = document.querySelector(selectors[i]);
-          if (btn && btn.offsetParent !== null) { btn.click(); return 'Clicked: ' + selectors[i]; }
-        }
-        var btns = document.querySelectorAll('button,a');
-        for (var j = 0; j < btns.length; j++) {
-          var t = (btns[j].innerText || '').toLowerCase();
-          if ((t.includes('accept all') || t.includes('accept cookies')) && btns[j].offsetParent !== null) {
-            btns[j].click(); return 'Clicked: ' + t;
-          }
-        }
-        return 'Not found';
-      }`);
-      console.log(`   Cookie 弹窗: ${r1}`);
-      await this.delay(1500);
-
-      // 弹窗处理完成后截图确认，暂停让 LLM 判断
-      await this.checkPageState('handlePopups 完成，确认弹窗已关闭', '弹窗应该已关闭，页面显示正常内容（文章列表或专题页），不应有任何遮挡弹窗');
-    }
+    await this.checkPageState('handlePopups 开始', '检查是否有弹窗需要处理', false);
+    await this._defaultHandlePopup();
+    await this.delay(3000);
+    await this._defaultHandleCookie();
+    await this.delay(1500);
+    await this.checkPageState('handlePopups 完成', '弹窗应已关闭，页面显示正常内容');
+  }
 
 
   // ── 去重 ─────────────────────────────────────────────────────

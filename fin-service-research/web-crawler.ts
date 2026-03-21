@@ -63,6 +63,31 @@ export interface MCPConfig {
   chromeUrl?: string;
 }
 
+/**
+ * executePage 各阶段 hook 回调接口
+ * 每个 hook 都是可选的，未提供时使用默认实现
+ */
+export interface ExecutePageHooks {
+  /** 阶段1: navigate 完成后，拿到页面文字和截图路径 */
+  afterNavigate?: (pageText: string, screenshotPath: string) => Promise<void>;
+  /** 阶段2: cookie banner 处理，返回 true 表示已点击处理 */
+  handleCookie?: (pageText: string) => Promise<boolean>;
+  /** 阶段3: 弹窗/投资者类型处理，返回 true 表示已点击处理 */
+  handlePopup?: (pageText: string) => Promise<boolean>;
+  /** 阶段4: 判断页面是否就绪可提取，返回 true 表示就绪 */
+  isPageReady?: (pageText: string, screenshotPath: string) => Promise<boolean>;
+  /** 阶段5: 自定义内容提取，返回提取到的文本 */
+  extractContent?: () => Promise<string>;
+  /** 阶段6: 拿到内容后保存 */
+  onSave?: (content: string, pageTitle: string, url: string) => Promise<void>;
+  /** 重试耗尽时调用，返回 true 表示用户已介入可继续，false 抛出错误 */
+  onRetryExhausted?: (reason: string, screenshotPath: string) => Promise<boolean>;
+  /** 最大就绪检查重试次数，默认 3 */
+  maxRetries?: number;
+  /** 每步等待毫秒数，默认 3000 */
+  stepDelay?: number;
+}
+
 // ============================================================================
 // MCP Chrome DevTools 客户端
 // ============================================================================
@@ -511,7 +536,7 @@ export abstract class BaseWebCrawler<T extends CrawlResult, P extends PageConfig
    *      - 如果 SSIM 显示无变化，额外问：没有变化是否正常？
    *   4. throwOnAbnormal=true 时抛出异常暂停，等 LLM 决定下一步
    */
-  async checkPageState(description: string, expectedState?: string, throwOnAbnormal: boolean = false): Promise<void> {
+  async checkPageState(description: string, expectedState?: string, throwOnAbnormal: boolean = false): Promise<{ pageText: string; screenshotPath: string }> {
     const ts = Date.now();
     const label = description.replace(/[^a-z0-9]+/gi, '-').substring(0, 40);
     const screenshotPath = path.join(this.screenshotDir, `check-${label}-${ts}.png`);
@@ -553,8 +578,9 @@ export abstract class BaseWebCrawler<T extends CrawlResult, P extends PageConfig
     console.log(`\n--- LLM 请回答以下问题 ---`);
     console.log(`Q1: 当前页面是否是 404 / Not Found / 无搜索结果 页面？`);
     console.log(`Q2: 当前页面是否有弹出窗口（popup/modal/overlay）遮挡内容？`);
+    console.log(`Q3: 当前页面需要用户做什么动作才能继续（例如：点击某个按钮、选择投资者类型、填写表单等）？`);
     if (noChange) {
-      console.log(`Q3: [SSIM 显示页面无变化] 在"${description}"操作后页面没有变化，这是正常的吗？如果不正常，可能的原因是什么？`);
+      console.log(`Q4: [SSIM 显示页面无变化] 在"${description}"操作后页面没有变化，这是正常的吗？如果不正常，可能的原因是什么？`);
     }
     console.log(`${'='.repeat(60)}\n`);
 
@@ -562,13 +588,237 @@ export abstract class BaseWebCrawler<T extends CrawlResult, P extends PageConfig
       throw new Error(
         `[PAGE CHECK PAUSE] "${description}" — ` +
         `截图: ${screenshotPath} | ${ssimInfo} | ` +
-        `LLM 请回答: Q1=是否404? Q2=是否有弹窗? ${noChange ? 'Q3=无变化是否正常?' : ''} ` +
+        `LLM 请回答: Q1=是否404? Q2=是否有弹窗? Q3=需要做什么动作? ${noChange ? 'Q4=无变化是否正常?' : ''} ` +
         `然后决定下一步操作`
       );
     }
+
+    return { pageText, screenshotPath };
   }
 
   abstract crawlAll(): Promise<T[]>;
   abstract crawlPage(page: P): Promise<T>;
   abstract saveResults(): void;
+
+  // ============================================================================
+  // executePage — 核心通用抓取流程，各阶段可通过 hooks 定制
+  // ============================================================================
+
+  /**
+   * 执行单页抓取的标准流程：
+   *   1. navigate → 截图判断
+   *   2. 处理 cookie banner
+   *   3. 处理弹窗（投资者类型等）
+   *   4. 检查页面是否就绪（最多 maxRetries 次）
+   *   5. 提取内容
+   *   6. 保存
+   *
+   * 每个阶段都有默认实现，通过 hooks 传入回调可覆盖。
+   */
+  async executePage(url: string, hooks: ExecutePageHooks = {}): Promise<string> {
+    const {
+      afterNavigate,
+      handleCookie,
+      handlePopup,
+      isPageReady,
+      extractContent,
+      onSave,
+      onRetryExhausted,
+      maxRetries = 3,
+      stepDelay = 3000,
+    } = hooks;
+
+    // ── 阶段1: Navigate ──────────────────────────────────────────
+    console.log(`\n🔗 [executePage] 导航到: ${url}`);
+    await this.mcpClient.navigatePage(url);
+    await this.delay(stepDelay);
+
+    const { pageText: textAfterNav, screenshotPath: ssAfterNav } =
+      await this.checkPageState('阶段1-navigate完成', `刚导航到 ${url}，判断页面初始状态`);
+    if (afterNavigate) await afterNavigate(textAfterNav, ssAfterNav);
+
+    // ── 阶段2: 弹窗（先处理，避免 cookie 点击后弹窗才出现）────
+    console.log('\n🪟 [阶段2] 处理弹窗...');
+    const popupHandled = handlePopup
+      ? await handlePopup(textAfterNav)
+      : await this._defaultHandlePopup();
+    if (popupHandled) {
+      await this.delay(stepDelay);
+      await this.checkPageState('阶段2-弹窗处理后', '弹窗应已关闭，页面应显示正常内容');
+    }
+
+    // ── 阶段3: Cookie ────────────────────────────────────────────
+    console.log('\n🍪 [阶段3] 处理 cookie banner...');
+    const cookieHandled = handleCookie
+      ? await handleCookie(textAfterNav)
+      : await this._defaultHandleCookie();
+    if (cookieHandled) {
+      await this.delay(stepDelay);
+      await this.checkPageState('阶段3-cookie处理后', 'cookie banner 应已关闭，页面正常显示');
+    }
+
+    // ── 阶段4: 页面就绪检查（最多 maxRetries 次）────────────────
+    console.log('\n✅ [阶段4] 检查页面是否就绪...');
+    let ready = false;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const { pageText, screenshotPath } = await this.checkPageState(
+        `阶段4-就绪检查第${attempt}次`,
+        '页面应无弹窗遮挡，有实际内容可提取，无404'
+      );
+      ready = isPageReady
+        ? await isPageReady(pageText, screenshotPath)
+        : await this._defaultIsPageReady(pageText);
+
+      if (ready) break;
+
+      console.log(`   ⚠️ 第 ${attempt}/${maxRetries} 次检查未就绪`);
+      if (attempt === maxRetries) {
+        const shouldContinue = onRetryExhausted
+          ? await onRetryExhausted(`页面经过 ${maxRetries} 次检查仍未就绪`, screenshotPath)
+          : false;
+        if (!shouldContinue) {
+          throw new Error(
+            `[executePage] 页面未就绪，已重试 ${maxRetries} 次。截图: ${screenshotPath}\n` +
+            `请查看截图，判断需要做什么操作，然后重新运行或手动介入。`
+          );
+        }
+      }
+      await this.delay(stepDelay);
+    }
+
+    // ── 阶段5: 提取内容 ──────────────────────────────────────────
+    console.log('\n📄 [阶段5] 提取内容...');
+    const content = extractContent
+      ? await extractContent()
+      : await this._defaultExtractContent();
+
+    const pageTitle: string = await this.mcpClient.evaluateScript(
+      `() => document.title || document.querySelector('h1')?.innerText || ''`
+    ) || '';
+
+    console.log(`   标题: ${pageTitle}`);
+    console.log(`   内容长度: ${content.length} 字符`);
+    await this.checkPageState('阶段5-提取完成', `内容已提取 ${content.length} 字符，标题: ${pageTitle}`);
+
+    // ── 阶段6: 保存 ──────────────────────────────────────────────
+    if (onSave) {
+      await onSave(content, pageTitle, url);
+    }
+
+    return content;
+  }
+
+  // ── 内部工具方法 ─────────────────────────────────────────────
+
+  /** 截图 + 抓页面文字，返回路径和文字 */
+  private async _snapshot(label: string): Promise<{ pageText: string; screenshotPath: string }> {
+    const ts = Date.now();
+    const safe = label.replace(/[^a-z0-9]+/gi, '-').substring(0, 40);
+    const screenshotPath = path.join(this.screenshotDir, `exec-${safe}-${ts}.png`);
+
+    let currentScreenshot: Buffer | null = null;
+    try {
+      currentScreenshot = await this.mcpClient.takeScreenshot();
+      if (currentScreenshot) fs.writeFileSync(screenshotPath, currentScreenshot);
+    } catch {}
+
+    // SSIM 与上次比较
+    if (this.lastScreenshot && currentScreenshot) {
+      const { changed, similarity } = await ImageComparator.compareBuffers(this.lastScreenshot, currentScreenshot);
+      console.log(`   📸 [${label}] SSIM: ${(similarity * 100).toFixed(1)}% — ${changed ? '有变化' : '无变化'} → ${screenshotPath}`);
+    } else {
+      console.log(`   📸 [${label}] → ${screenshotPath}`);
+    }
+    if (currentScreenshot) this.lastScreenshot = currentScreenshot;
+
+    let pageText = '';
+    try {
+      pageText = await this.mcpClient.evaluateScript('() => document.body.innerText.substring(0, 800)') || '';
+    } catch {}
+
+    return { pageText, screenshotPath };
+  }
+
+  /** 默认 cookie 处理：优先 reject，其次 accept */
+  protected async _defaultHandleCookie(): Promise<boolean> {
+    const result = await this.mcpClient.evaluateScript(`() => {
+      var selectors = [
+        '#onetrust-reject-all-handler',
+        'button[id*="reject-all"]',
+        '#onetrust-accept-btn-handler',
+        'button[id*="accept-all"]',
+        'button[class*="accept-all"]'
+      ];
+      for (var i = 0; i < selectors.length; i++) {
+        var btn = document.querySelector(selectors[i]);
+        if (btn && btn.offsetParent !== null) { btn.click(); return 'clicked:' + selectors[i]; }
+      }
+      var btns = Array.from(document.querySelectorAll('button,a'));
+      for (var j = 0; j < btns.length; j++) {
+        var t = (btns[j].innerText || '').toLowerCase().trim();
+        if ((t === 'accept all' || t === 'reject all' || t === 'accept cookies') && btns[j].offsetParent !== null) {
+          btns[j].click(); return 'clicked:' + t;
+        }
+      }
+      return 'not-found';
+    }`);
+    const found = result !== 'not-found';
+    console.log(`   Cookie: ${result}`);
+    return found;
+  }
+
+  /** 默认弹窗处理：投资者类型选择，宽泛匹配 */
+  protected async _defaultHandlePopup(): Promise<boolean> {
+    const result = await this.mcpClient.evaluateScript(`() => {
+      var candidates = Array.from(document.querySelectorAll('a,button,li,[role="button"],div[class*="investor"],div[class*="professional"]'));
+      var keywords = [
+        'investment professional', 'professional investor', 'institutional investor',
+        'i am a professional', 'professional client', 'identify as an investment professional',
+        'investment professionals', 'institutional investors', 'financial intermediar'
+      ];
+      for (var i = 0; i < candidates.length; i++) {
+        var el = candidates[i];
+        var t = (el.innerText || el.textContent || '').trim().toLowerCase();
+        var cls = (el.className || '').toString();
+        if (cls.includes('js-professional-investor')) { el.click(); return 'clicked:js-professional-investor'; }
+        for (var k = 0; k < keywords.length; k++) {
+          if (t.includes(keywords[k])) { el.click(); return 'clicked:' + t.substring(0, 60); }
+        }
+      }
+      return 'not-found';
+    }`);
+    const found = result !== 'not-found';
+    console.log(`   弹窗: ${result}`);
+    return found;
+  }
+
+  /** 默认页面就绪判断：没有明显弹窗且有足够文字内容 */
+  private async _defaultIsPageReady(pageText: string): Promise<boolean> {
+    const lower = pageText.toLowerCase();
+    const hasBlocker =
+      lower.includes('404') ||
+      lower.includes('not found') ||
+      lower.includes('confirm your') ||
+      lower.includes('select your') ||
+      lower.includes('choose your');
+    const hasContent = pageText.length > 300;
+    return !hasBlocker && hasContent;
+  }
+
+  /** 默认内容提取：常见正文选择器 */
+  private async _defaultExtractContent(): Promise<string> {
+    return await this.mcpClient.evaluateScript(`() => {
+      var selectors = [
+        'article', '.article-body', '.article__body', '.content-body',
+        '.cmp-text', '[class*="article-content"]', 'main', '[role="main"]'
+      ];
+      for (var i = 0; i < selectors.length; i++) {
+        var el = document.querySelector(selectors[i]);
+        if (el && el.innerText && el.innerText.trim().length > 300) {
+          return el.innerText.trim().substring(0, 10000);
+        }
+      }
+      return document.body.innerText.trim().substring(0, 10000);
+    }`) || '';
+  }
 }

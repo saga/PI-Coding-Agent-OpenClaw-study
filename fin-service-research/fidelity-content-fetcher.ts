@@ -118,69 +118,62 @@ class FidelityContentFetcher extends BaseWebCrawler<FetchResult, FetchTask> {
     console.log(`🔗 URL: ${task.url}`);
     console.log('-'.repeat(60));
 
+    let items: ContentItem[] = [];
+    const alreadyHandled = this.popupsHandled;
+    let taskResult: FetchResult | null = null;
+
     try {
-      // 1. 导航
-      console.log('  → 导航到页面...');
-      await this.getMcpClient().navigatePage(task.url);
-      try { await this.getMcpClient().waitFor(task.waitForTexts, 30000); } catch {}
-      console.log('  → 额外等待 6 秒...');
-      await this.delay(6000);
+      await this.executePage(task.url, {
+        // 弹窗只处理一次，后续 session 已记住
+        handlePopup: alreadyHandled ? async () => false : undefined,
+        handleCookie: alreadyHandled ? async () => false : undefined,
 
-      // 2. 弹窗（只处理一次，后续页面 session 已记住）
-      if (!this.popupsHandled) {
-        console.log('  → 处理弹窗...');
-        await this.handleInitialPopups();
-        this.popupsHandled = true;
-      }
+        // 阶段4: 页面就绪判断
+        isPageReady: async (pageText) => {
+          const lower = pageText.toLowerCase();
+          // 有弹窗残留或明显错误页则未就绪
+          if (lower.includes('confirm your') || lower.includes('select your') ||
+              lower.includes('404') || lower.includes('not found')) return false;
+          // search-and-fetch 需要等搜索结果出现
+          if (task.contentType === 'search-and-fetch') {
+            return lower.includes('result') || lower.includes('article') || pageText.length > 500;
+          }
+          return pageText.length > 300;
+        },
 
-      // 3. 按 contentType 分发
-      let items: ContentItem[] = [];
-      if (task.contentType === 'insight-cards') {
-        items = await this.extractInsightCards(task);
-      } else if (task.contentType === 'search-and-fetch') {
-        items = await this.searchAndFetch(task);
-      }
+        // 阶段5: 按 contentType 提取
+        extractContent: async () => {
+          if (task.contentType === 'insight-cards') {
+            items = await this.extractInsightCards(task);
+          } else {
+            items = await this.searchAndFetch(task);
+          }
+          console.log(`  ✅ 找到 ${items.length} 条内容`);
+          return JSON.stringify(items);
+        },
 
-      console.log(`  ✅ 找到 ${items.length} 条内容`);
-      const title = await this.getMcpClient().evaluateScript('() => document.title');
-      return { url: task.url, pageTitle: title || task.taskName, taskName: task.taskName, items, crawlTime: new Date().toISOString() };
+        // 阶段6: 保存由 saveResults 统一处理，这里只收集
+        onSave: async (_content, pageTitle) => {
+          const result: FetchResult = {
+            url: task.url, pageTitle: pageTitle || task.taskName,
+            taskName: task.taskName, items, crawlTime: new Date().toISOString()
+          };
+          // 用 taskResult 暂存，crawlPage 返回后由 crawlAll 统一 push
+          taskResult = result;
+        },
+
+        stepDelay: 4000,
+        maxRetries: 3,
+      });
+
+      // 标记弹窗已处理
+      if (!alreadyHandled) this.popupsHandled = true;
 
     } catch (error) {
       console.error(`❌ 任务失败: ${task.taskName}`, error);
-      return { url: task.url, pageTitle: task.taskName, taskName: task.taskName, items: [], crawlTime: new Date().toISOString() };
     }
-  }
 
-  // ── 弹窗处理 ────────────────────────────────────────────────
-
-  private async handleInitialPopups(): Promise<void> {
-    const r1 = await this.getMcpClient().evaluateScript(`() => {
-      for (const el of document.querySelectorAll('a,button')) {
-        const t = (el.innerText || '').trim();
-        if (t === 'Institutional Investors' || t.includes('Institutional')) {
-          el.click(); return 'Clicked: ' + t;
-        }
-      }
-      return 'Not found';
-    }`);
-    console.log(`     投资者弹窗: ${r1}`);
-    await this.delay(2000);
-
-    const r2 = await this.getMcpClient().evaluateScript(`() => {
-      for (const sel of ['#onetrust-accept-btn-handler','button[id*="accept"]','button[class*="accept"]']) {
-        const btn = document.querySelector(sel);
-        if (btn && btn.offsetParent !== null) { btn.click(); return 'Clicked: ' + sel; }
-      }
-      for (const btn of document.querySelectorAll('button,a')) {
-        const t = (btn.innerText || '').toLowerCase();
-        if ((t.includes('accept all') || t.includes('accept cookies')) && btn.offsetParent !== null) {
-          btn.click(); return 'Clicked by text: ' + t;
-        }
-      }
-      return 'Not found';
-    }`);
-    console.log(`     Cookie 弹窗: ${r2}`);
-    await this.delay(1500);
+    return taskResult ?? { url: task.url, pageTitle: task.taskName, taskName: task.taskName, items: [], crawlTime: new Date().toISOString() };
   }
 
   // ── insight-cards 模式 ───────────────────────────────────────
@@ -221,64 +214,45 @@ class FidelityContentFetcher extends BaseWebCrawler<FetchResult, FetchTask> {
     const maxArticles = task.maxArticles ?? 10;
     console.log(`  → 搜索: "${query}"`);
 
-    // 直接导航到搜索结果页（绕过搜索框触发问题）
+    // 直接导航到搜索结果页
     const searchUrl = `${BASE_URL}/search/query/${encodeURIComponent(query)}`;
     console.log(`  → 导航到搜索结果页: ${searchUrl}`);
     await this.getMcpClient().navigatePage(searchUrl);
+    await this.delay(4000);
 
-    // 轮询等待搜索结果（每3秒检查一次，最多30秒）
-    console.log('  → 等待搜索结果（最多30秒，轮询中）...');
-    let searchLinks: { text: string; href: string }[] = [];
-    for (let i = 0; i < 10; i++) {
-      await this.delay(3000);
-      searchLinks = await this.getMcpClient().evaluateScript(`() => {
-        return Array.from(document.querySelectorAll('a[href*="/articles/"], a[href*="/page/"]'))
-          .map(a => ({ text: (a.innerText || a.textContent || '').trim().substring(0, 120), href: a.href }))
-          .filter(a => a.text.length > 5)
-          .filter((a, i, arr) => arr.findIndex(b => b.href === a.href) === i); // 去重
-      }`) || [];
-      console.log(`     第${i+1}次检查: ${searchLinks.length} 条结果`);
-      if (searchLinks.length > 0) break;
-      if (i === 2) {
-        const debug = await this.getMcpClient().evaluateScript(`() => document.body.innerText.substring(0, 500)`);
-        console.log(`     [debug] 页面内容: ${debug}`);
-      }
-    }
+    // 截图检查搜索结果页状态，让 LLM 判断
+    await this.checkPageState(
+      `搜索"${query}"结果页`,
+      '应显示搜索结果列表，如果页面空白或有弹窗请说明',
+      false
+    );
 
-    console.log(`  → 找到 ${searchLinks.length} 个搜索结果，抓取前 ${maxArticles} 篇正文`);
+    // 提取搜索结果链接（一次，不轮询）
+    const searchLinks: { text: string; href: string }[] = await this.getMcpClient().evaluateScript(`() => {
+      return Array.from(document.querySelectorAll('a[href*="/articles/"], a[href*="/page/"]'))
+        .map(a => ({ text: (a.innerText || a.textContent || '').trim().substring(0, 120), href: a.href }))
+        .filter(a => a.text.length > 5)
+        .filter((a, i, arr) => arr.findIndex(b => b.href === a.href) === i);
+    }`) || [];
+
+    console.log(`  → 找到 ${searchLinks.length} 个结果，抓取前 ${maxArticles} 篇`);
 
     const items: ContentItem[] = [];
-    const toFetch = searchLinks.slice(0, maxArticles);
-
-    for (const link of toFetch) {
+    for (const link of searchLinks.slice(0, maxArticles)) {
       console.log(`  → 抓取: ${link.text.substring(0, 60)}...`);
       await this.getMcpClient().navigatePage(link.href);
-      await this.delay(5000);
+      await this.delay(4000);
 
       const body: string = await this.getMcpClient().evaluateScript(`() =>
-        (document.querySelector('body')?.innerText || '').trim().substring(0, 6000)
+        (document.querySelector('article, .article-body, main')?.innerText ||
+         document.body?.innerText || '').trim().substring(0, 6000)
       `) || '';
 
-      // 从 URL 或正文提取日期
       const urlDateMatch = link.href.match(/\d{4}-\d{2}-\d{2}/);
       const bodyDateMatch = body.match(/(\d{2})\/(\d{2})\/(\d{4})/);
-      let date = '';
-      if (urlDateMatch) {
-        date = urlDateMatch[0];
-      } else if (bodyDateMatch) {
-        date = `${bodyDateMatch[3]}-${bodyDateMatch[2]}-${bodyDateMatch[1]}`;
-      }
+      const date = urlDateMatch?.[0] || (bodyDateMatch ? `${bodyDateMatch[3]}-${bodyDateMatch[2]}-${bodyDateMatch[1]}` : '');
 
-      items.push({
-        title: link.text,
-        url: link.href,
-        date,
-        type: 'Article',
-        meta: '',
-        summary: body.substring(0, 300),
-        body
-      });
-
+      items.push({ title: link.text, url: link.href, date, type: 'Article', meta: '', summary: body.substring(0, 300), body });
       await this.delay(2000);
     }
 
