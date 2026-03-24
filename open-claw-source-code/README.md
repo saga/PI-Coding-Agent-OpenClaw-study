@@ -18,13 +18,7 @@ git clone https://github.com/openclaw/openclaw.git open-claw-source-code/opencla
 
 ## 更新到最新版本
 
-```powershell
-# 进入源码目录并拉取最新代码
-cd open-claw-source-code/openclaw
-git pull origin main
-```
-
-或者一行命令：
+从项目根目录执行：
 
 ```powershell
 cd open-claw-source-code/openclaw; git pull origin main
