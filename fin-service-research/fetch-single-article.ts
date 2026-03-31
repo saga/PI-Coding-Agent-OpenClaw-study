@@ -1,14 +1,13 @@
 /**
  * 抓取单篇文章 — 使用 BaseWebCrawler.executePage 核心流程
- * 目标: https://www.fidelityinternational.com/articles/expert-opinions/ais-big-breakthrough-wont-happen-this-year-c236d3
  * 运行: npx ts-node fetch-single-article.ts
  */
 import * as fs from 'fs';
 import * as path from 'path';
 import { BaseWebCrawler, CrawlResult, PageConfig } from './web-crawler';
 
-const TARGET_URL = 'https://www.fidelityinternational.com/articles/expert-opinions/ais-big-breakthrough-wont-happen-this-year-c236d3';
-const OUTPUT_DIR = './fidelity-international-research';
+const TARGET_URL = 'https://www.xxx';
+const OUTPUT_DIR = './xxx';
 
 interface ArticleResult extends CrawlResult {
   body: string;
@@ -24,9 +23,6 @@ class SingleArticleFetcher extends BaseWebCrawler<ArticleResult, PageConfig> {
     await this.getMcpClient().connect('fetch-article');
     try {
       await this.executePage(TARGET_URL, {
-        // 阶段3: fidelityinternational.com 需要先点投资者类型，再处理 cookie
-        // 默认 handlePopup 已覆盖投资者类型关键词，这里直接复用
-        // 阶段6: 保存结果
         onSave: async (content, pageTitle, url) => {
           if (content.length < 200) {
             console.log('⚠️  正文太短，可能未成功提取，请查看截图');

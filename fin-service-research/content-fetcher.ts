@@ -1,9 +1,4 @@
 /**
- * Fidelity Content Fetcher
- * 深度抓取 Fidelity International 网站的具体内容页面
- *
- * 运行:
- *   npx ts-node fidelity-content-fetcher.ts
  *
  * 支持两种模式：
  *   - insight-cards：抓取 investment-insight 页面的卡片列表（按日期过滤）
@@ -57,9 +52,7 @@ const FETCH_TASKS: FetchTask[] = [
   // 任务一：抓取 investment-insight 卡片列表（最近30天）- 暂时禁用
   // {
   //   taskName: 'investment-insight',
-  //   contentType: 'insight-cards',
-  //   url: 'https://professionals.fidelity.co.uk/perspectives/investment-insight',
-  //   name: 'investment-insight',
+  //   contentType: 'insight-cards',  //   name: 'investment-insight',
   //   waitForTexts: ['investment', 'insight'],
   //   recentDays: 30
   // },
@@ -67,7 +60,7 @@ const FETCH_TASKS: FetchTask[] = [
   {
     taskName: 'iran-conflict-search',
     contentType: 'search-and-fetch',
-    url: 'https://professionals.fidelity.co.uk/perspectives/investment-insight',
+    url: 'https://xxx',
     name: 'iran-conflict-search',
     waitForTexts: ['insight'],
     searchQuery: 'Iran conflict 2026',
@@ -76,13 +69,13 @@ const FETCH_TASKS: FetchTask[] = [
 ];
 
 const OUTPUT_DIR = './crawl-results';
-const BASE_URL = 'https://professionals.fidelity.co.uk';
+const BASE_URL = 'https://xxx';
 
 // ============================================================================
 // 主类
 // ============================================================================
 
-class FidelityContentFetcher extends BaseWebCrawler<FetchResult, FetchTask> {
+class ContentFetcher extends BaseWebCrawler<FetchResult, FetchTask> {
   private popupsHandled = false;
 
   constructor() {
@@ -90,11 +83,11 @@ class FidelityContentFetcher extends BaseWebCrawler<FetchResult, FetchTask> {
   }
 
   async crawlAll(): Promise<FetchResult[]> {
-    console.log('🚀 Fidelity Content Fetcher 启动');
+    console.log('🚀 Content Fetcher 启动');
     console.log(`📋 任务数: ${FETCH_TASKS.length}`);
     console.log('='.repeat(60));
 
-    await this.getMcpClient().connect('fidelity-content-fetcher');
+    await this.getMcpClient().connect('content-fetcher');
 
     try {
       for (const task of FETCH_TASKS) {
@@ -289,9 +282,9 @@ class FidelityContentFetcher extends BaseWebCrawler<FetchResult, FetchTask> {
 
 async function main(): Promise<void> {
   console.log('\n' + '='.repeat(80));
-  console.log('Fidelity Content Fetcher');
+  console.log('Content Fetcher');
   console.log('='.repeat(80));
-  const fetcher = new FidelityContentFetcher();
+  const fetcher = new ContentFetcher();
   try {
     await fetcher.crawlAll();
     console.log(`\n📁 结果保存在: ${OUTPUT_DIR}/`);
