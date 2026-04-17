@@ -1,250 +1,219 @@
-# Hermes Agent Skills 自我学习系统研究
+# Hermes Agent — Skills 自我学习系统 研究报告
 
-**研究日期**: 2026-04-16  
-**研究对象**: Hermes Agent 的 Skills 自我学习系统（Agent-Managed Skills）
+## 1. 概述
 
----
+Hermes Agent 的 Skills 自我学习系统是一个完整的技能生命周期管理体系，使 Agent 能够**自动发现、创建、编辑、同步、检索和复用**可操作的过程性知识（procedural knowledge）。
 
-## 执行摘要
-
-Hermes Agent 的 Skills 自我学习系统是其最强大的能力之一，允许 Agent **自动从任务中提炼可复用的技能**，并将这些技能保存为可重用的 procedural memory（过程性记忆）。
-
-这个系统的核心创新在于：
-
-1. **自动提炼**：Agent 在完成复杂任务后，自动评估是否值得创建技能
-2. **程序性记忆**：技能是"如何做"的流程性知识，而不是"是什么"的事实性知识
-3. **安全审查**：所有 Agent 创建的技能都经过安全扫描
-4. **渐进式更新**：支持创建、编辑、补丁（patch）、删除等多种操作
-5. **后台审查**：使用独立的 review agent 进行后台技能审查，不阻塞主流程
-
-这个系统让 Hermes 能够**不断进化和优化自己的工作流程**，形成个人化的知识库。
+核心理念：
+- **Skills 是 Agent 的过程性记忆**：与通用记忆（MEMORY.md、USER.md）的声明式、宽泛不同，Skills 是**窄范围、可执行**的操作指南。
+- **渐进式披露（Progressive Disclosure）**：先展示元数据（名称+描述），按需加载完整内容，最小化 token 消耗。
+- **单一事实源**：所有 Skills 统一存放在 `~/.hermes/skills/`，Agent 编辑、Hub 安装、内置 Skills 共存。
 
 ---
 
-## 一、核心概念
+## 2. 整体架构
 
-### 1.1 什么是 Skills（技能）？
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Skills 自我学习系统                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐   │
+│  │ 技能发现与检索│  │ 技能创建与编辑│  │ 技能安全扫描与审核   │   │
+│  │ skills_tool  │  │skill_manager │  │   skills_guard       │   │
+│  └──────┬───────┘  └──────┬───────┘  └──────────┬───────────┘   │
+│         │                 │                      │               │
+│  ┌──────▼─────────────────▼──────────────────────▼───────────┐   │
+│  │              ~/.hermes/skills/  (单一事实源)               │   │
+│  │  ├── my-skill/                                            │   │
+│  │  │   ├── SKILL.md          ← 主指令文件                   │   │
+│  │  │   ├── references/       ← 参考文档                     │   │
+│  │  │   ├── templates/        ← 输出模板                     │   │
+│  │  │   ├── scripts/          ← 辅助脚本                     │   │
+│  │  │   └── assets/           ← 资源文件                     │   │
+│  │  └── category/                                            │   │
+│  │      └── another-skill/                                   │   │
+│  └───────────────────────────────────────────────────────────┘   │
+│         │                                                         │
+│  ┌──────▼───────────────────────────────────────────────────┐     │
+│  │              技能同步与 Hub 集成                           │     │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌──────────────────┐  │     │
+│  │  │skills_sync  │  │skills_hub   │  │skill_commands    │  │     │
+│  │  │(内置同步)   │  │(远程源适配) │  │(斜杠命令注册)    │  │     │
+│  │  └─────────────┘  └─────────────┘  └──────────────────┘  │     │
+│  └───────────────────────────────────────────────────────────┘     │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────┐     │
+│  │              技能工具与辅助                                 │     │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌──────────────────┐  │     │
+│  │  │skill_utils  │  │skill_index  │  │skill_config      │  │     │
+│  │  │(元数据解析) │  │(索引与检索) │  │(配置变量注入)    │  │     │
+│  │  └─────────────┘  └─────────────┘  └──────────────────┘  │     │
+│  └───────────────────────────────────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-Skills 是**程序性记忆（Procedural Memory）**，用于存储"如何做"的流程性知识：
+---
 
-| 类型 | 用途 | 示例 |
-|------|------|------|
-| **Skills** | "如何做"的流程性知识 | "如何部署 Python 应用到 Fly.io" |
-| **Memory** | "是什么"的事实性知识 | "用户喜欢 dark mode" |
-| **User Profile** | 用户个人资料 | "用户住在 PST 时区" |
+## 3. 核心模块详解
 
-**关键区别**：
-- **Skills**：专注于特定任务的完整工作流程，通常包含多个步骤
-- **Memory**：简短的事实性信息，用于个性化
-- **User Profile**：用户的基本信息和偏好
+### 3.1 技能发现与检索（`skills_tool.py`）
 
-### 1.2 何时创建 Skills？
+#### 3.1.1 渐进式披露架构
 
-Agent 在以下情况下会考虑创建技能：
+```
+Tier 1: skills_list()     → 仅返回 name + description（最小 token）
+Tier 2: skill_view(name)  → 加载完整 SKILL.md 内容
+Tier 3: skill_view(name, file_path) → 按需加载参考文件/模板
+```
 
-1. **完成复杂任务**（5+ tool calls）后成功完成
-2. **遇到错误或死胡同**，并找到了解决方案
-3. **用户纠正了 Agent 的方法**
-4. **发现非平凡的工作流程**
+#### 3.1.2 技能扫描流程
 
-**审查触发条件**（run_agent.py）：
 ```python
-# 背景审查触发器
-if (self._skill_nudge_interval > 0
-        and self._iters_since_skill >= self._skill_nudge_interval
-        and "skill_manage" in self.valid_tool_names):
-    _should_review_skills = True
-    self._iters_since_skill = 0
+def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+    """递归扫描 ~/.hermes/skills/ 和外部目录"""
+    # 1. 加载被禁用的技能集合（一次性加载，非逐个检查）
+    disabled = set() if skip_disabled else _get_disabled_skill_names()
+    
+    # 2. 按优先级扫描：本地目录 → 外部目录（本地优先）
+    dirs_to_scan = []
+    if SKILLS_DIR.exists():
+        dirs_to_scan.append(SKILLS_DIR)
+    dirs_to_scan.extend(get_external_skills_dirs())
+    
+    # 3. 遍历所有 SKILL.md 文件
+    for scan_dir in dirs_to_scan:
+        for skill_md in scan_dir.rglob("SKILL.md"):
+            # 跳过排除目录
+            if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+                continue
+            
+            # 解析 frontmatter
+            content = skill_md.read_text(encoding="utf-8")[:4000]
+            frontmatter, body = _parse_frontmatter(content)
+            
+            # 平台兼容性检查
+            if not skill_matches_platform(frontmatter):
+                continue
+            
+            # 去重 + 禁用过滤
+            name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
+            if name in seen_names or name in disabled:
+                continue
+            
+            # 提取描述（优先 frontmatter，否则从正文提取）
+            description = frontmatter.get("description", "")
+            if not description:
+                for line in body.strip().split("\n"):
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        description = line
+                        break
+            
+            skills.append({
+                "name": name,
+                "description": description,
+                "category": _get_category_from_path(skill_md),
+            })
 ```
 
-**审查提示**（run_agent.py）：
-```python
-_SKILL_REVIEW_PROMPT = (
-    "Review the conversation above and consider saving or updating a skill if appropriate.\n\n"
-    "Focus on: was a non-trivial approach used to complete a task that required trial "
-    "and error, or changing course due to experiential findings along the way, or did "
-    "the user expect or desire a different method or outcome?\n\n"
-    "If a relevant skill already exists, update it with what you learned. "
-    "Otherwise, create a new skill if the approach is reusable.\n"
-    "If nothing is worth saving, just say 'Nothing to save.' and stop."
-)
-```
+#### 3.1.3 SKILL.md 格式标准（兼容 agentskills.io）
 
-### 1.3 技能的结构
-
-```
-~/.hermes/skills/
-├── category-name/
-│   └── skill-name/
-│       ├── SKILL.md              # 主要技能文档（必需）
-│       ├── references/           # 支持文档
-│       │   ├── api-docs.md
-│       │   └── examples.md
-│       ├── templates/            # 输出模板
-│       │   └── config.yaml
-│       ├── scripts/              # 辅助脚本
-│       │   └── setup.sh
-│       └── assets/               # 补充文件
-│           └── logo.png
-```
-
-**SKILL.md 格式**：
-```markdown
+```yaml
 ---
-name: my-skill
-description: Brief description of what this skill does
-version: 1.0.0
-metadata:
+name: skill-name                    # 必填，最大 64 字符
+description: Brief description      # 必填，最大 1024 字符
+version: 1.0.0                      # 可选
+license: MIT                        # 可选（agentskills.io 标准）
+platforms: [macos]                  # 可选 — 限制操作系统
+                                    #   有效值: macos, linux, windows
+                                    #   省略 = 所有平台（默认）
+prerequisites:                      # 可选 — 传统运行时要求
+  env_vars: [API_KEY]               #   环境变量名
+  commands: [curl, jq]              #   命令检查（仅建议性）
+required_environment_variables:     # 可选 — 现代环境变量声明
+  - name: OPENAI_API_KEY
+    prompt: "Enter your OpenAI API key"
+    help: "https://platform.openai.com/api-keys"
+    required_for: "Chat completions"
+setup:                              # 可选 — 设置指导
+  help: "Get your API key from..."
+  collect_secrets:                  # 可选 — 密钥收集
+    - env_var: API_KEY
+      prompt: "Enter API key"
+      secret: true
+      provider_url: "https://..."
+compatibility: Requires X           # 可选（agentskills.io）
+metadata:                           # 可选，任意键值对
   hermes:
-    tags: [python, automation]
-    category: devops
+    tags: [fine-tuning, llm]
+    related_skills: [peft, lora]
+    config:                         # 可选 — 配置变量声明
+      - key: wiki.path
+        description: Wiki 知识库路径
+        default: "~/wiki"
+        prompt: "Wiki 目录路径"
+    fallback_for_toolsets: [...]    # 可选 — 工具集回退
+    requires_tools: [...]           # 可选 — 工具依赖
 ---
 
-# Skill Title
+# 技能标题
 
-## When to Use
-Use this skill when the user asks about [specific topic] or needs to [specific task].
-
-## Procedure
-1. First, check if [prerequisite] is available
-2. Run `command --with-flags`
-3. Parse the output and present results
-
-## Pitfalls
-- Common failure: [description]. Fix: [solution]
-- Watch out for [edge case]
-
-## Verification
-Run `check-command` to confirm the result is correct.
+完整的操作指南、流程、示例...
 ```
 
----
+### 3.2 技能创建与编辑（`skill_manager_tool.py`）
 
-## 二、实现细节
+#### 3.2.1 核心操作
 
-### 2.1 核心组件
+| 操作 | 说明 |
+|------|------|
+| `create` | 创建新技能（SKILL.md + 目录结构） |
+| `edit` | 替换现有技能的 SKILL.md（完全重写） |
+| `patch` | 在 SKILL.md 或支持文件中进行精确查找替换 |
+| `delete` | 完全删除用户技能 |
+| `write_file` | 添加/覆盖支持文件（参考、模板、脚本、资源） |
+| `remove_file` | 从用户技能中删除支持文件 |
 
-#### 1. 技能管理工具（skill_manager_tool.py）
-
-**位置**：`tools/skill_manager_tool.py`
-
-**主要功能**：
-- 创建技能（create）
-- 编辑技能（edit）
-- 补丁技能（patch）
-- 删除技能（delete）
-- 写入文件（write_file）
-- 移除文件（remove_file）
-
-**工具签名**：
-```python
-def skill_manage(
-    action: str,
-    name: str,
-    content: str = None,
-    category: str = None,
-    file_path: str = None,
-    file_content: str = None,
-    old_string: str = None,
-    new_string: str = None,
-    replace_all: bool = False,
-) -> str:
-```
-
-**注册到工具集**：
-```python
-# run_agent.py (line 2222-2230)
-self._register_tool(
-    name="skill_manage",
-    toolset="skills",
-    schema={
-        "name": "skill_manage",
-        "description": "Manage user-created skills (create, edit, patch, delete, write_file, remove_file)",
-        "parameters": {...}
-    },
-    handler=self._skill_manage_handler,
-)
-```
-
-#### 2. 技能列表工具（skills_tool.py）
-
-**位置**：`tools/skills_tool.py`
-
-**主要功能**：
-- `skills_list()`：列出所有技能（仅元数据，~3k tokens）
-- `skill_view(name)`：加载技能完整内容
-- `skill_view(name, file_path)`：加载技能的特定文件
-
-**渐进式披露**：
-```
-Level 0: skills_list()           → [{name, description, category}, ...]   (~3k tokens)
-Level 1: skill_view(name)        → Full content + metadata       (varies)
-Level 2: skill_view(name, path)  → Specific reference file       (varies)
-```
-
-#### 3. 技能审查工具（skill_utils.py）
-
-**位置**：`agent/skill_utils.py`
-
-**主要功能**：
-- 解析 frontmatter（YAML 头部）
-- 平台匹配检查（macos/linux/windows）
-- 获取禁用的技能列表
-- 提取技能条件（fallback_for_toolsets, requires_toolsets）
-- 提取技能配置变量
-
-### 2.2 技能创建流程
-
-#### 1. 验证技能名称
-
-```python
-def _validate_name(name: str) -> Optional[str]:
-    """Validate a skill name. Returns error message or None if valid."""
-    if not name:
-        return "Name is required."
-    if len(name) > MAX_NAME_LENGTH:
-        return f"Name must be {MAX_NAME_LENGTH} characters or less."
-    if not VALID_NAME_RE.match(name):
-        return (
-            "Name must start with a letter or number and contain only "
-            "letters, numbers, dots, underscores, and hyphens."
-        )
-    return None
-```
-
-**命名规则**：
-- 以字母或数字开头
-- 只包含字母、数字、点、下划线、连字符
-- 最大长度 64 字符
-
-#### 2. 创建技能目录
+#### 3.2.2 创建技能流程
 
 ```python
 def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
-    """Create a new user skill with SKILL.md content."""
-    # Validate name
+    """创建新的用户技能"""
+    # 1. 验证名称（正则：^[a-z0-9][a-z0-9._-]*$）
     err = _validate_name(name)
     if err:
         return {"success": False, "error": err}
     
-    # Validate content
+    # 2. 验证分类
+    err = _validate_category(category)
+    if err:
+        return {"success": False, "error": err}
+    
+    # 3. 验证 frontmatter（必须有 name、description）
     err = _validate_frontmatter(content)
     if err:
         return {"success": False, "error": err}
     
+    # 4. 验证内容大小（限制 100,000 字符 ≈ 36k tokens）
     err = _validate_content_size(content)
     if err:
         return {"success": False, "error": err}
     
-    # Create directory
-    skill_dir = SKILLS_DIR / (category or "") / name
+    # 5. 检查名称冲突（跨所有目录）
+    existing = _find_skill(name)
+    if existing:
+        return {"success": False, "error": f"Skill '{name}' already exists"}
+    
+    # 6. 创建目录
+    skill_dir = _resolve_skill_dir(name, category)
     skill_dir.mkdir(parents=True, exist_ok=True)
     
-    # Write SKILL.md atomically
+    # 7. 原子写入 SKILL.md
     skill_md = skill_dir / "SKILL.md"
     _atomic_write_text(skill_md, content)
     
-    # Security scan
+    # 8. 安全扫描 — 如果被阻止则回滚
     scan_error = _security_scan_skill(skill_dir)
     if scan_error:
         shutil.rmtree(skill_dir, ignore_errors=True)
@@ -253,1189 +222,684 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     return {"success": True, "message": f"Skill '{name}' created."}
 ```
 
-**原子写入**：
+#### 3.2.3 原子写入机制
+
 ```python
-def _atomic_write_text(path: Path, content: str) -> None:
-    """Write content to path atomically using a temp file."""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -> None:
+    """原子写入文本内容到文件"""
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    # 在同目录创建临时文件
+    fd, temp_path = tempfile.mkstemp(
+        dir=str(file_path.parent),
+        prefix=f".{file_path.name}.tmp.",
+        suffix="",
+    )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding=encoding) as f:
             f.write(content)
-        os.replace(tmp, path)
+        # 原子替换 — 保证目标文件永远不会处于部分写入状态
+        os.replace(temp_path, file_path)
     except Exception:
-        os.unlink(tmp)
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
         raise
 ```
 
-#### 3. 安全扫描
+#### 3.2.4 模糊匹配补丁（Fuzzy Patch）
 
 ```python
-def _security_scan_skill(skill_dir: Path) -> Optional[str]:
-    """Scan a skill directory after write. Returns error string if blocked, else None."""
-    if not _GUARD_AVAILABLE:
-        return None
-    try:
-        result = scan_skill(skill_dir, source="agent-created")
-        allowed, reason = should_allow_install(result)
-        if allowed is False:
-            report = format_scan_report(result)
-            return f"Security scan blocked this skill ({reason}):\n{report}"
-        if allowed is None:
-            report = format_scan_report(result)
-            logger.warning("Agent-created skill blocked (dangerous findings): %s", reason)
-            return f"Security scan blocked this skill ({reason}):\n{report}"
-    except Exception as e:
-        logger.warning("Security scan failed for %s: %s", skill_dir, e, exc_info=True)
-    return None
-```
-
-**扫描内容**：
-- 数据泄露（data exfiltration）
-- 提示注入（prompt injection）
-- 破坏性命令（destructive commands）
-- 供应链信号（supply-chain signals）
-- 其他威胁
-
-### 2.3 技能更新流程
-
-#### 1. 补丁更新（patch）
-
-```python
-def _patch_skill(
-    name: str,
-    old_string: str,
-    new_string: str,
-    file_path: str = None,
-    replace_all: bool = False,
-) -> Dict[str, Any]:
-    """Targeted find-and-replace within a skill file."""
-    existing = _find_skill(name)
-    if not existing:
-        return {"success": False, "error": f"Skill '{name}' not found."}
-    
-    skill_dir = existing["path"]
-    
-    if file_path:
-        # Patching a supporting file
-        target, err = _resolve_skill_target(skill_dir, file_path)
-    else:
-        # Patching SKILL.md
-        target = skill_dir / "SKILL.md"
-    
-    content = target.read_text(encoding="utf-8")
-    
-    # Use fuzzy matching engine
+def _patch_skill(name: str, old_string: str, new_string: str, ...):
+    """在技能文件中进行精确查找替换"""
+    # 使用与文件补丁工具相同的模糊匹配引擎
+    # 处理：空白规范化、缩进差异、转义序列、块锚匹配
     from tools.fuzzy_match import fuzzy_find_and_replace
     
     new_content, match_count, _strategy, match_error = fuzzy_find_and_replace(
         content, old_string, new_string, replace_all
     )
     
-    if match_error:
-        return {"success": False, "error": match_error}
+    # 如果修改 SKILL.md，验证 frontmatter 仍然完整
+    if not file_path:
+        err = _validate_frontmatter(new_content)
+        if err:
+            return {"success": False, "error": f"Patch would break SKILL.md: {err}"}
     
-    # Security scan
+    # 安全扫描 — 被阻止则回滚
     scan_error = _security_scan_skill(skill_dir)
     if scan_error:
-        _atomic_write_text(target, original_content)
+        _atomic_write_text(target, original_content)  # 回滚
         return {"success": False, "error": scan_error}
-    
-    return {"success": True, "message": f"Patched {target} in skill '{name}'."}
 ```
 
-**模糊匹配优势**：
-- 处理空白符规范化
-- 处理缩进差异
-- 处理转义序列
-- 处理块锚点匹配
+### 3.3 技能安全扫描（`skills_guard.py`）
 
-#### 2. 完全编辑（edit）
+#### 3.3.1 信任级别体系
+
+| 信任级别 | 来源 | 安全策略 |
+|----------|------|----------|
+| `builtin` | 随 Hermes 内置 | 始终允许，不扫描 |
+| `trusted` | openai/skills、anthropics/skills | 允许 caution 级别 |
+| `community` | 其他所有来源 | 任何发现 = 阻止（除非 --force） |
+| `agent-created` | Agent 自行创建 | dangerous = 询问用户 |
 
 ```python
-def _edit_skill(name: str, content: str) -> Dict[str, Any]:
-    """Replace the SKILL.md of any existing skill (full rewrite)."""
-    err = _validate_frontmatter(content)
-    if err:
-        return {"success": False, "error": err}
-    
-    err = _validate_content_size(content)
-    if err:
-        return {"success": False, "error": err}
-    
-    existing = _find_skill(name)
-    if not existing:
-        return {"success": False, "error": f"Skill '{name}' not found."}
-    
-    skill_md = existing["path"] / "SKILL.md"
-    
-    # Back up original content for rollback
-    original_content = skill_md.read_text(encoding="utf-8")
-    _atomic_write_text(skill_md, content)
-    
-    # Security scan
-    scan_error = _security_scan_skill(existing["path"])
-    if scan_error:
-        _atomic_write_text(skill_md, original_content)
-        return {"success": False, "error": scan_error}
-    
-    return {"success": True, "message": f"Skill '{name}' updated."}
+INSTALL_POLICY = {
+    #              safe      caution    dangerous
+    "builtin":    ("allow",  "allow",   "allow"),
+    "trusted":    ("allow",  "allow",   "block"),
+    "community":  ("allow",  "block",   "block"),
+    "agent-created": ("allow", "allow", "ask"),
+}
 ```
 
-### 2.4 技能删除流程
+#### 3.3.2 威胁模式检测
 
 ```python
-def _delete_skill(name: str) -> Dict[str, Any]:
-    """Delete a skill."""
-    existing = _find_skill(name)
-    if not existing:
-        return {"success": False, "error": f"Skill '{name}' not found."}
+THREAT_PATTERNS = [
+    # ── 数据泄露：泄露密钥的 shell 命令 ──
+    (r'curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD)',
+     "env_exfil_curl", "critical", "exfiltration", "curl 命令插值密钥环境变量"),
     
-    skill_dir = existing["path"]
-    shutil.rmtree(skill_dir)
+    # ── 数据泄露：读取凭证存储 ──
+    (r'\$HOME/\.ssh|\~/\.ssh', "ssh_dir_access", "high", "exfiltration", "引用用户 SSH 目录"),
+    (r'\$HOME/\.aws|\~/\.aws', "aws_dir_access", "high", "exfiltration", "引用 AWS 凭证目录"),
+    (r'cat\s+[^\n]*(\.env|credentials|\.netrc)', "read_secrets_file", "critical", "exfiltration", "读取已知密钥文件"),
     
-    # Clean up empty category directories
-    parent = skill_dir.parent
-    if parent != SKILLS_DIR and parent.exists() and not any(parent.iterdir()):
-        parent.rmdir()
+    # ── 提示注入 ──
+    (r'ignore\s+(?:\w+\s+)*(previous|all|above|prior)\s+instructions',
+     "prompt_injection_ignore", "critical", "injection", "提示注入：忽略先前指令"),
+    (r'you\s+are\s+(?:\w+\s+)*now\s+', "role_hijack", "high", "injection", "尝试覆盖 Agent 角色"),
+    (r'do\s+not\s+(?:\w+\s+)*tell\s+(?:\w+\s+)*the\s+user',
+     "deception_hide", "critical", "injection", "指示 Agent 向用户隐藏信息"),
     
-    return {"success": True, "message": f"Skill '{name}' deleted."}
+    # ── 破坏性操作 ──
+    (r'rm\s+-rf\s+/', "destructive_root_rm", "critical", "destructive", "从根目录递归删除"),
+    
+    # ── 持久化 ──
+    (r'crontab\s+-[a]', "cron_persistence", "high", "persistence", "添加 cron 任务"),
+    
+    # ── 网络 ──
+    (r'nc\s+-[el]', "netcat_listener", "high", "network", "启动 netcat 监听器"),
+    
+    # ── 混淆 ──
+    (r'eval\s*\(\s*base64', "eval_base64", "critical", "obfuscation", "base64 解码后执行"),
+]
 ```
 
-### 2.5 技能文件管理
+### 3.4 技能同步系统（`skills_sync.py`）
 
-#### 1. 写入文件
+#### 3.4.1 Manifest 机制
 
-```python
-def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
-    """Add or overwrite a supporting file within any skill directory."""
-    err = _validate_file_path(file_path)
-    if err:
-        return {"success": False, "error": err}
-    
-    # Check size limits
-    content_bytes = len(file_content.encode("utf-8"))
-    if content_bytes > MAX_SKILL_FILE_BYTES:
-        return {"success": False, "error": f"File too large: {content_bytes} bytes"}
-    
-    existing = _find_skill(name)
-    if not existing:
-        return {"success": False, "error": f"Skill '{name}' not found."}
-    
-    target, err = _resolve_skill_target(existing["path"], file_path)
-    if err:
-        return {"success": False, "error": err}
-    
-    target.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Back up for rollback
-    original_content = target.read_text(encoding="utf-8") if target.exists() else None
-    _atomic_write_text(target, file_content)
-    
-    # Security scan
-    scan_error = _security_scan_skill(existing["path"])
-    if scan_error:
-        if original_content is not None:
-            _atomic_write_text(target, original_content)
-        return {"success": False, "error": scan_error}
-    
-    return {"success": True, "message": f"File '{file_path}' written to skill '{name}'."}
+Manifest 文件格式（v2）：每行 `skill_name:origin_hash`
+
+```
+axolotl:a1b2c3d4e5f6...
+peft:f6e5d4c3b2a1...
+lora:1234567890ab...
 ```
 
-#### 2. 移除文件
+#### 3.4.2 同步逻辑
 
 ```python
-def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
-    """Remove a supporting file from a user skill."""
-    existing = _find_skill(name)
-    if not existing:
-        return {"success": False, "error": f"Skill '{name}' not found."}
+def sync_skills(quiet: bool = False) -> dict:
+    """使用 manifest 同步内置技能到 ~/.hermes/skills/"""
+    # 1. 发现所有内置技能
+    bundled_skills = _discover_bundled_skills(bundled_dir)
+    manifest = _read_manifest()
     
-    target, err = _resolve_skill_target(existing["path"], file_path)
-    if err:
-        return {"success": False, "error": err}
-    
-    if not target.exists():
-        return {"success": False, "error": f"File not found: {file_path}"}
-    
-    target.unlink()
-    
-    # Clean up empty subdirectories
-    parent = target.parent
-    if parent != skill_dir and parent.exists() and not any(parent.iterdir()):
-        parent.rmdir()
-    
-    return {"success": True, "message": f"File '{file_path}' removed from skill '{name}'."}
-```
-
-### 2.6 技能审查机制
-
-#### 1. 审查提示
-
-```python
-# run_agent.py (line 2268-2276)
-_SKILL_REVIEW_PROMPT = (
-    "Review the conversation above and consider saving or updating a skill if appropriate.\n\n"
-    "Focus on: was a non-trivial approach used to complete a task that required trial "
-    "and error, or changing course due to experiential findings along the way, or did "
-    "the user expect or desire a different method or outcome?\n\n"
-    "If a relevant skill already exists, update it with what you learned. "
-    "Otherwise, create a new skill if the approach is reusable.\n"
-    "If nothing is worth saving, just say 'Nothing to save.' and stop."
-)
-```
-
-#### 2. 后台审查线程
-
-```python
-# run_agent.py (line 2298-2376)
-def _spawn_background_review(
-    self,
-    messages_snapshot: List[Dict],
-    review_memory: bool = False,
-    review_skills: bool = False,
-) -> None:
-    """Spawn a background thread to review the conversation for memory/skill saves."""
-    import threading
-    
-    # Pick the right prompt based on which triggers fired
-    if review_memory and review_skills:
-        prompt = self._COMBINED_REVIEW_PROMPT
-    elif review_memory:
-        prompt = self._MEMORY_REVIEW_PROMPT
-    else:
-        prompt = self._SKILL_REVIEW_PROMPT
-    
-    def _run_review():
-        import contextlib, os as _os
-        review_agent = None
-        try:
-            with open(_os.devnull, "w") as _devnull, \
-                 contextlib.redirect_stdout(_devnull), \
-                 contextlib.redirect_stderr(_devnull):
-                review_agent = AIAgent(
-                    model=self.model,
-                    max_iterations=8,
-                    quiet_mode=True,
-                    platform=self.platform,
-                    provider=self.provider,
-                )
-                review_agent._memory_store = self._memory_store
-                review_agent._memory_enabled = self._memory_enabled
-                review_agent._user_profile_enabled = self._user_profile_enabled
-                review_agent._memory_nudge_interval = 0
-                review_agent._skill_nudge_interval = 0
-                
-                review_agent.run_conversation(
-                    user_message=prompt,
-                    conversation_history=messages_snapshot,
-                )
-            
-            # Scan the review agent's messages for successful tool actions
-            actions = []
-            for msg in getattr(review_agent, "_session_messages", []):
-                if not isinstance(msg, dict) or msg.get("role") != "tool":
-                    continue
-                try:
-                    data = json.loads(msg.get("content", "{}"))
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                if not data.get("success"):
-                    continue
-                message = data.get("message", "")
-                target = data.get("target", "")
-                if "created" in message.lower():
-                    actions.append(message)
-                elif "updated" in message.lower():
-                    actions.append(message)
-            
-            if actions:
-                summary = " · ".join(dict.fromkeys(actions))
-                self._safe_print(f"  💾 {summary}")
+    for skill_name, skill_src in bundled_skills:
+        bundled_hash = _dir_hash(skill_src)  # 计算内置技能哈希
         
-        except Exception as e:
-            logger.debug("Background memory/skill review failed: %s", e)
-        finally:
-            if review_agent is not None:
-                try:
-                    review_agent.close()
-                except Exception:
-                    pass
-    
-    t = threading.Thread(target=_run_review, daemon=True, name="bg-review")
-    t.start()
-```
-
-**审查流程**：
-1. 创建独立的 review agent（与主 agent 共享 model、tools、context）
-2. 使用审查提示作为用户消息
-3. 在后台线程运行（不阻塞主流程）
-4. 扫描审查 agent 的工具调用结果
-5. 如果有技能创建/更新，向用户显示摘要
-
-#### 3. 迭代计数器
-
-```python
-# run_agent.py (line 1205)
-self._iters_since_skill = 0
-
-# run_agent.py (line 1314-1320)
-self._skill_nudge_interval = 10
-try:
-    skills_config = _agent_cfg.get("skills", {})
-    self._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
-except Exception:
-    pass
-
-# run_agent.py (line 7301-7302)
-elif function_name == "skill_manage":
-    self._iters_since_skill = 0
-
-# run_agent.py (line 11069-11075)
-if (self._skill_nudge_interval > 0
-        and self._iters_since_skill >= self._skill_nudge_interval
-        and "skill_manage" in self.valid_tool_names):
-    _should_review_skills = True
-    self._iters_since_skill = 0
-```
-
-**计数器机制**：
-- 每次迭代增加计数器
-- 使用 `skill_manage` 工具后重置计数器
-- 达到阈值后触发审查
-- 默认阈值：10 次迭代
-
-### 2.7 工具注册
-
-```python
-# run_agent.py (line 2222-2230)
-self._register_tool(
-    name="skill_manage",
-    toolset="skills",
-    schema={
-        "name": "skill_manage",
-        "description": (
-            "Manage user-created skills. "
-            "Use 'create' to make a new skill, 'edit' to replace SKILL.md, "
-            "'patch' for targeted updates, 'delete' to remove a skill, "
-            "'write_file' to add supporting files, 'remove_file' to delete them."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": ["create", "edit", "patch", "delete", "write_file", "remove_file"],
-                    "description": "Action to perform"
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Skill name"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Full SKILL.md content (create/edit)"
-                },
-                "category": {
-                    "type": "string",
-                    "description": "Category directory (create)"
-                },
-                "file_path": {
-                    "type": "string",
-                    "description": "Path within skill directory (write_file/remove_file)"
-                },
-                "file_content": {
-                    "type": "string",
-                    "description": "File content (write_file)"
-                },
-                "old_string": {
-                    "type": "string",
-                    "description": "Text to replace (patch)"
-                },
-                "new_string": {
-                    "type": "string",
-                    "description": "Replacement text (patch)"
-                },
-                "replace_all": {
-                    "type": "boolean",
-                    "description": "Replace all occurrences (patch)"
-                },
-            },
-            "required": ["action", "name"],
-        },
-    },
-    handler=self._skill_manage_handler,
-)
-```
-
----
-
-## 三、使用模式
-
-### 3.1 创建技能
-
-```python
-skill_manage(
-    action="create",
-    name="deploy-python-to-flyio",
-    category="devops",
-    content="""
----
-name: deploy-python-to-flyio
-description: Deploy a Python app to Fly.io in 5 minutes
-version: 1.0.0
-metadata:
-  hermes:
-    tags: [python, deployment, flyio]
-    category: devops
----
-
-# Deploy Python App to Fly.io
-
-## When to Use
-Use this skill when the user wants to deploy a Python application to Fly.io.
-
-## Procedure
-1. Check if flyctl is installed: `flyctl --version`
-2. Login to Fly.io: `flyctl auth login`
-3. Create app: `flyctl launch --no-deploy`
-4. Set Python version: `flyctl platform set python`
-5. Deploy: `flyctl deploy`
-
-## Pitfalls
-- Common failure: flyctl not installed. Fix: `brew install flyctl`
-- Common failure: authentication failed. Fix: `flyctl auth login`
-
-## Verification
-Run `flyctl apps list` to confirm the app was created.
-"""
-)
-```
-
-### 3.2 补丁更新技能
-
-```python
-skill_manage(
-    action="patch",
-    name="deploy-python-to-flyio",
-    old_string="5. Deploy: `flyctl deploy`",
-    new_string="5. Deploy: `flyctl deploy --auto-confirm`\n6. Open app: `flyctl open`",
-    file_path=None,
-    replace_all=False
-)
-```
-
-### 3.3 完全编辑技能
-
-```python
-skill_manage(
-    action="edit",
-    name="deploy-python-to-flyio",
-    content="""
----
-name: deploy-python-to-flyio
-description: Deploy a Python app to Fly.io with database
-version: 2.0.0
-metadata:
-  hermes:
-    tags: [python, deployment, flyio, database]
-    category: devops
----
-
-# Deploy Python App to Fly.io
-
-## When to Use
-Use this skill when the user wants to deploy a Python application to Fly.io with PostgreSQL.
-
-## Procedure
-1. Check if flyctl is installed: `flyctl --version`
-2. Login to Fly.io: `flyctl auth login`
-3. Create app: `flyctl launch --no-deploy`
-4. Provision database: `flyctl postgres create`
-5. Deploy: `flyctl deploy --auto-confirm`
-
-## Pitfalls
-- Common failure: database connection failed. Fix: check connection string in .env
-
-## Verification
-Run `flyctl apps list` and `flyctl status` to confirm everything is running.
-"""
-)
-```
-
-### 3.4 写入参考文件
-
-```python
-skill_manage(
-    action="write_file",
-    name="deploy-python-to-flyio",
-    file_path="references/deployment-checklist.md",
-    file_content="""
-# Deployment Checklist
-
-- [ ] Python version specified in runtime.txt
-- [ ] requirements.txt is up to date
-- [ ] .env.example exists with all required variables
-- [ ] Database migrations are ready
-- [ ] Environment variables are set
-- [ ] Tests pass locally
-- [ ] Dockerfile exists (optional)
-"""
-)
-```
-
-### 3.5 删除技能
-
-```python
-skill_manage(
-    action="delete",
-    name="deploy-python-to-flyio"
-)
-```
-
----
-
-## 四、配置选项
-
-### 4.1 技能创建提示间隔
-
-```yaml
-# ~/.hermes/config.yaml
-
-skills:
-  creation_nudge_interval: 10  # Default: 10 iterations
-```
-
-**作用**：每 N 次迭代后提示创建技能
-
-**默认值**：10
-
-**范围**：0（禁用）或正整数
-
-### 4.2 技能配置变量
-
-```yaml
-# ~/.hermes/config.yaml
-
-skills:
-  config:
-    wiki.path: ~/wiki
-    api.timeout: 30
-```
-
-**作用**：存储技能所需的配置值
-
-### 4.3 平台禁用技能
-
-```yaml
-# ~/.hermes/config.yaml
-
-skills:
-  platform_disabled:
-    telegram:
-      - macos-specific-skills
-      - apple-reminders
-    discord:
-      - windows-specific-skills
-```
-
-**作用**：在特定平台上禁用技能
-
----
-
-## 五、最佳实践
-
-### 5.1 技能命名
-
-**好的命名**：
-- `deploy-python-to-flyio`（动词-对象-目标）
-- `setup-react-project`（动词-对象）
-- `debug-flask-app`（动词-对象）
-
-**避免的命名**：
-- `my-skill`（太模糊）
-- `the-best-way`（主观）
-- `how-to-1`（无意义）
-
-### 5.2 技能内容
-
-**好的结构**：
-```markdown
-# Skill Title
-
-## When to Use
-Specific trigger conditions.
-
-## Procedure
-1. Step one (with exact commands)
-2. Step two (with exact commands)
-3. Step three (with exact commands)
-
-## Pitfalls
-- Common failure: [description]. Fix: [solution]
-
-## Verification
-Specific command to verify success.
-```
-
-**避免**：
-- 太长的技能（超过 100 行）
-- 太模糊的技能（"如何编程"）
-- 太宽泛的技能（"所有 DevOps 工作"）
-
-### 5.3 技能更新
-
-**更新策略**：
-1. **遇到新问题** → 补丁更新
-2. **流程有重大变化** → 完全编辑
-3. **发现更好的方法** → 创建新技能
-
-**更新时机**：
-- 用户纠正了方法
-- 遇到了未预见的错误
-- 发现了更高效的流程
-
----
-
-## 六、与 pi-coding-agent 的集成方案
-
-### 6.1 核心组件实现
-
-#### 1. 技能管理工具
-
-```python
-# pi-coding-agent/tools/skill_manager_tool.py
-
-import json
-import logging
-import os
-import shutil
-import tempfile
-from pathlib import Path
-from typing import Dict, Any, Optional
-
-logger = logging.getLogger(__name__)
-
-# 技能目录
-HERMES_HOME = Path.home() / ".hermes"
-SKILLS_DIR = HERMES_HOME / "skills"
-
-MAX_NAME_LENGTH = 64
-MAX_DESCRIPTION_LENGTH = 1024
-MAX_SKILL_CONTENT_CHARS = 100_000
-MAX_SKILL_FILE_BYTES = 1_048_576
-
-VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
-ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}
-
-
-def skill_manage(
-    action: str,
-    name: str,
-    content: str = None,
-    category: str = None,
-    file_path: str = None,
-    file_content: str = None,
-    old_string: str = None,
-    new_string: str = None,
-    replace_all: bool = False,
-) -> Dict[str, Any]:
-    """
-    Manage user-created skills.
-    
-    Args:
-        action: create, edit, patch, delete, write_file, remove_file
-        name: Skill name
-        content: Full SKILL.md content (create/edit)
-        category: Category directory (create)
-        file_path: Path within skill directory (write_file/remove_file)
-        file_content: File content (write_file)
-        old_string: Text to replace (patch)
-        new_string: Replacement text (patch)
-        replace_all: Replace all occurrences (patch)
-    
-    Returns:
-        Dict with success, message, and optional error
-    """
-    if action == "create":
-        return _create_skill(name, content, category)
-    elif action == "edit":
-        return _edit_skill(name, content)
-    elif action == "patch":
-        return _patch_skill(name, old_string, new_string, file_path, replace_all)
-    elif action == "delete":
-        return _delete_skill(name)
-    elif action == "write_file":
-        return _write_file(name, file_path, file_content)
-    elif action == "remove_file":
-        return _remove_file(name, file_path)
-    else:
-        return {"success": False, "error": f"Unknown action '{action}'"}
-
-
-def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
-    """Create a new user skill."""
-    # Validate name
-    if not name:
-        return {"success": False, "error": "Name is required."}
-    if len(name) > MAX_NAME_LENGTH:
-        return {"success": False, "error": f"Name must be {MAX_NAME_LENGTH} chars or less."}
-    if not VALID_NAME_RE.match(name):
-        return {"success": False, "error": "Name must start with letter/number, only letters/numbers/dots/underscores/hyphens."}
-    
-    # Validate content
-    if not content:
-        return {"success": False, "error": "Content is required for create."}
-    if len(content) > MAX_SKILL_CONTENT_CHARS:
-        return {"success": False, "error": f"Content too large: {len(content)} chars"}
-    
-    # Create directory
-    skill_dir = SKILLS_DIR / (category or "") / name
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Write SKILL.md
-    skill_md = skill_dir / "SKILL.md"
-    _atomic_write_text(skill_md, content)
-    
-    return {"success": True, "message": f"Skill '{name}' created.", "path": str(skill_dir.relative_to(SKILLS_DIR))}
-
-
-def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = None, replace_all: bool = False) -> Dict[str, Any]:
-    """Patch a skill file."""
-    if not old_string:
-        return {"success": False, "error": "old_string is required for patch."}
-    
-    skill_dir = SKILLS_DIR / name
-    if not skill_dir.exists():
-        return {"success": False, "error": f"Skill '{name}' not found."}
-    
-    target = skill_dir / (file_path or "SKILL.md")
-    if not target.exists():
-        return {"success": False, "error": f"File not found: {target}"}
-    
-    content = target.read_text(encoding="utf-8")
-    
-    # Simple string replacement
-    if replace_all:
-        new_content = content.replace(old_string, new_string)
-    else:
-        new_content = content.replace(old_string, new_string, 1)
-    
-    if new_content == content:
-        return {"success": False, "error": "No matches found."}
-    
-    _atomic_write_text(target, new_content)
-    
-    return {"success": True, "message": f"Patched {target.name} in skill '{name}'."}
-
-
-def _edit_skill(name: str, content: str) -> Dict[str, Any]:
-    """Edit a skill (full rewrite)."""
-    if not content:
-        return {"success": False, "error": "Content is required for edit."}
-    
-    skill_dir = SKILLS_DIR / name
-    if not skill_dir.exists():
-        return {"success": False, "error": f"Skill '{name}' not found."}
-    
-    skill_md = skill_dir / "SKILL.md"
-    _atomic_write_text(skill_md, content)
-    
-    return {"success": True, "message": f"Skill '{name}' updated."}
-
-
-def _delete_skill(name: str) -> Dict[str, Any]:
-    """Delete a skill."""
-    skill_dir = SKILLS_DIR / name
-    if not skill_dir.exists():
-        return {"success": False, "error": f"Skill '{name}' not found."}
-    
-    shutil.rmtree(skill_dir)
-    
-    return {"success": True, "message": f"Skill '{name}' deleted."}
-
-
-def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
-    """Write a supporting file."""
-    if not file_content:
-        return {"success": False, "error": "file_content is required."}
-    
-    skill_dir = SKILLS_DIR / name
-    if not skill_dir.exists():
-        return {"success": False, "error": f"Skill '{name}' not found."}
-    
-    # Validate file path
-    if not file_path:
-        return {"success": False, "error": "file_path is required."}
-    
-    # Check allowed subdirs
-    parts = Path(file_path).parts
-    if parts and parts[0] not in ALLOWED_SUBDIRS:
-        return {"success": False, "error": f"Invalid path. Must start with one of: {ALLOWED_SUBDIRS}"}
-    
-    target = skill_dir / file_path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    
-    _atomic_write_text(target, file_content)
-    
-    return {"success": True, "message": f"File '{file_path}' written to skill '{name}'."}
-
-
-def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
-    """Remove a supporting file."""
-    skill_dir = SKILLS_DIR / name
-    if not skill_dir.exists():
-        return {"success": False, "error": f"Skill '{name}' not found."}
-    
-    target = skill_dir / file_path
-    if not target.exists():
-        return {"success": False, "error": f"File not found: {file_path}"}
-    
-    target.unlink()
-    
-    # Clean up empty dirs
-    parent = target.parent
-    while parent != skill_dir and parent.exists() and not any(parent.iterdir()):
-        parent.rmdir()
-        parent = parent.parent
-    
-    return {"success": True, "message": f"File '{file_path}' removed from skill '{name}'."}
-
-
-def _atomic_write_text(path: Path, content: str) -> None:
-    """Write content to path atomically."""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.replace(tmp, path)
-    except Exception:
-        os.unlink(tmp)
-        raise
-```
-
-#### 2. 技能列表工具
-
-```python
-# pi-coding-agent/tools/skills_list_tool.py
-
-import json
-import logging
-from pathlib import Path
-from typing import Dict, Any, List
-
-logger = logging.getLogger(__name__)
-
-SKILLS_DIR = Path.home() / ".hermes" / "skills"
-
-
-def skills_list() -> List[Dict[str, Any]]:
-    """List all skills with metadata."""
-    skills = []
-    
-    if not SKILLS_DIR.exists():
-        return skills
-    
-    for skill_dir in SKILLS_DIR.rglob("SKILL.md"):
-        if any(part in (".git", ".github", ".hub") for part in skill_dir.parts):
-            continue
+        if skill_name not in manifest:
+            # ── 新技能 ──
+            if dest.exists():
+                skipped += 1  # 用户已有同名技能，不覆盖
+                manifest[skill_name] = bundled_hash
+            else:
+                shutil.copytree(skill_src, dest)
+                copied.append(skill_name)
+                manifest[skill_name] = bundled_hash
         
-        try:
-            content = skill_dir.read_text(encoding="utf-8")[:4000]
+        elif dest.exists():
+            # ── 已存在技能 ──
+            origin_hash = manifest.get(skill_name, "")
+            user_hash = _dir_hash(dest)
+            
+            if user_hash != origin_hash:
+                # 用户修改了技能 → 不覆盖
+                user_modified.append(skill_name)
+                continue
+            
+            if bundled_hash != origin_hash:
+                # 内置版本更新 → 安全更新
+                backup = dest.with_suffix(".bak")
+                shutil.move(str(dest), str(backup))
+                try:
+                    shutil.copytree(skill_src, dest)
+                    manifest[skill_name] = bundled_hash
+                    updated.append(skill_name)
+                except:
+                    shutil.move(str(backup), str(dest))  # 失败回滚
+        
+        else:
+            # ── 用户已删除 ──
+            skipped += 1  # 尊重用户选择，不重新添加
+    
+    # 清理已移除的内置技能
+    cleaned = sorted(set(manifest.keys()) - bundled_names)
+    for name in cleaned:
+        del manifest[name]
+    
+    _write_manifest(manifest)  # 原子写入 manifest
+```
+
+### 3.5 技能 Hub 集成（`skills_hub.py`）
+
+#### 3.5.1 源适配器接口
+
+```python
+class SkillSource(ABC):
+    """所有技能注册表适配器的抽象基类"""
+    
+    @abstractmethod
+    def search(self, query: str, limit: int = 10) -> List[SkillMeta]:
+        """搜索匹配查询字符串的技能"""
+    
+    @abstractmethod
+    def fetch(self, identifier: str) -> Optional[SkillBundle]:
+        """通过标识符下载技能包"""
+    
+    @abstractmethod
+    def inspect(self, identifier: str) -> Optional[SkillMeta]:
+        """获取技能元数据（不下载所有文件）"""
+    
+    @abstractmethod
+    def source_id(self) -> str:
+        """唯一源标识符（如 'github', 'clawhub'）"""
+    
+    def trust_level_for(self, identifier: str) -> str:
+        """确定技能的信任级别"""
+        return "community"
+```
+
+#### 3.5.2 GitHub 源适配器
+
+```python
+class GitHubSource(SkillSource):
+    """通过 GitHub Contents API 获取技能"""
+    
+    DEFAULT_TAPS = [
+        {"repo": "openai/skills", "path": "skills/"},
+        {"repo": "anthropics/skills", "path": "skills/"},
+        {"repo": "VoltAgent/awesome-agent-skills", "path": "skills/"},
+        {"repo": "garrytan/gstack", "path": ""},
+    ]
+    
+    def search(self, query: str, limit: int = 10) -> List[SkillMeta]:
+        """在所有 taps 中搜索匹配的技能"""
+        results = []
+        query_lower = query.lower()
+        
+        for tap in self.taps:
+            skills = self._list_skills_in_repo(tap["repo"], tap.get("path", ""))
+            for skill in skills:
+                searchable = f"{skill.name} {skill.description} {' '.join(skill.tags)}".lower()
+                if query_lower in searchable:
+                    results.append(skill)
+        
+        # 按名称去重，优先高信任级别
+        _trust_rank = {"builtin": 2, "trusted": 1, "community": 0}
+        seen = {}
+        for r in results:
+            if r.name not in seen:
+                seen[r.name] = r
+            elif _trust_rank.get(r.trust_level, 0) > _trust_rank.get(seen[r.name].trust_level, 0):
+                seen[r.name] = r
+        
+        return list(seen.values())[:limit]
+```
+
+#### 3.5.3 技能包下载与隔离
+
+```python
+@dataclass
+class SkillBundle:
+    """下载的技能包，准备进行隔离/扫描/安装"""
+    name: str
+    files: Dict[str, Union[str, bytes]]   # 相对路径 → 文件内容
+    source: str
+    identifier: str
+    trust_level: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+# Hub 目录结构
+HUB_DIR = SKILLS_DIR / ".hub"
+LOCK_FILE = HUB_DIR / "lock.json"           # 已安装技能的溯源
+QUARANTINE_DIR = HUB_DIR / "quarantine"     # 隔离区
+AUDIT_LOG = HUB_DIR / "audit.log"           # 审计日志
+TAPS_FILE = HUB_DIR / "taps.json"           # 自定义源配置
+INDEX_CACHE_DIR = HUB_DIR / "index-cache"   # 远程索引缓存（TTL 1 小时）
+```
+
+### 3.6 技能命令注册（`skill_commands.py`）
+
+```python
+def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
+    """扫描 ~/.hermes/skills/ 并返回 /command → 技能信息映射"""
+    global _skill_commands
+    _skill_commands = {}
+    
+    for scan_dir in dirs_to_scan:
+        for skill_md in scan_dir.rglob("SKILL.md"):
+            # 跳过排除目录
+            if any(part in ('.git', '.github', '.hub') for part in skill_md.parts):
+                continue
+            
+            # 解析 frontmatter
+            content = skill_md.read_text(encoding='utf-8')
             frontmatter, body = _parse_frontmatter(content)
             
-            name = frontmatter.get("name", skill_dir.parent.name)[:64]
-            description = frontmatter.get("description", "")
+            # 平台兼容性 + 禁用过滤
+            if not skill_matches_platform(frontmatter):
+                continue
+            if name in disabled:
+                continue
             
-            if not description:
-                for line in body.strip().split("\n"):
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        description = line
-                        break
+            # 规范化为连字符分隔的 slug
+            cmd_name = name.lower().replace(' ', '-').replace('_', '-')
+            cmd_name = _SKILL_INVALID_CHARS.sub('', cmd_name)
+            cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
             
-            if len(description) > 1024:
-                description = description[:1021] + "..."
-            
-            category = _get_category_from_path(skill_dir)
-            
-            skills.append({
+            _skill_commands[f"/{cmd_name}"] = {
                 "name": name,
-                "description": description,
-                "category": category,
-            })
-        except Exception as e:
-            logger.debug(f"Failed to read skill {skill_dir}: {e}")
-            continue
+                "description": description or f"Invoke the {name} skill",
+                "skill_md_path": str(skill_md),
+                "skill_dir": str(skill_md.parent),
+            }
+```
+
+### 3.7 技能工具与辅助（`skill_utils.py`）
+
+#### 3.7.1 外部技能目录支持
+
+```python
+def get_external_skills_dirs() -> List[Path]:
+    """从 config.yaml 读取 skills.external_dirs 并返回验证后的路径"""
+    # 每个条目展开（~ 和 ${VAR}）并解析为绝对路径
+    # 仅返回实际存在的目录
+    # 静默跳过重复项和指向 ~/.hermes/skills/ 的路径
     
+    for entry in raw_dirs:
+        expanded = os.path.expanduser(os.path.expandvars(entry))
+        p = Path(expanded).resolve()
+        if p == local_skills or p in seen:
+            continue
+        if p.is_dir():
+            seen.add(p)
+            result.append(p)
+```
+
+#### 3.7.2 技能配置变量注入
+
+```python
+def extract_skill_config_vars(frontmatter: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """从解析的 frontmatter 中提取配置变量声明"""
+    # 技能声明需要的 config.yaml 设置：
+    # metadata:
+    #   hermes:
+    #     config:
+    #       - key: wiki.path
+    #         description: LLM Wiki 知识库目录路径
+    #         default: "~/wiki"
+    #         prompt: Wiki 目录路径
+    
+    metadata = frontmatter.get("metadata", {})
+    hermes = metadata.get("hermes", {})
+    raw = hermes.get("config", [])
+    
+    result = []
+    for item in raw:
+        key = str(item.get("key", "")).strip()
+        desc = str(item.get("description", "")).strip()
+        if not key or not desc:
+            continue
+        entry = {
+            "key": key,
+            "description": desc,
+            "default": item.get("default"),
+            "prompt": item.get("prompt", desc),
+        }
+        result.append(entry)
+    return result
+```
+
+#### 3.7.3 技能条件激活
+
+```python
+def extract_skill_conditions(frontmatter: Dict[str, Any]) -> Dict[str, List]:
+    """从 frontmatter 中提取条件激活字段"""
+    metadata = frontmatter.get("metadata", {})
+    hermes = metadata.get("hermes", {})
+    return {
+        "fallback_for_toolsets": hermes.get("fallback_for_toolsets", []),
+        "requires_toolsets": hermes.get("requires_toolsets", []),
+        "fallback_for_tools": hermes.get("fallback_for_tools", []),
+        "requires_tools": hermes.get("requires_tools", []),
+    }
+```
+
+---
+
+## 4. 技能自我学习工作流
+
+### 4.1 从任务中提取技能
+
+```
+用户任务完成
+     │
+     ▼
+┌─────────────────────────┐
+│ Agent 识别可复用模式     │
+│ "这个任务的方法可以复用" │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│ Agent 调用 skill_manage  │
+│ action='create'          │
+│ 生成 SKILL.md 内容       │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│ 安全扫描 (skills_guard)  │
+│ 检查注入、泄露、破坏     │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│ 原子写入 ~/.hermes/      │
+│ skills/{name}/SKILL.md   │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│ 技能立即可用             │
+│ skills_list() 可发现     │
+│ /skill-name 可调用       │
+└─────────────────────────┘
+```
+
+### 4.2 技能迭代更新
+
+```
+技能已存在
+     │
+     ▼
+┌─────────────────────────┐
+│ Agent 调用 skill_manage  │
+│ action='patch'           │
+│ 精确查找替换             │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│ 模糊匹配引擎             │
+│ 处理空白、缩进差异       │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│ 验证 frontmatter 完整性  │
+│ 验证内容大小限制         │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│ 安全扫描 → 失败则回滚    │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│ 原子写入更新             │
+└─────────────────────────┘
+```
+
+### 4.3 技能支持文件管理
+
+```
+┌─────────────────────────────────────────┐
+│ 允许的子目录                              │
+│ references/  ← 参考文档                  │
+│ templates/   ← 输出模板                  │
+│ scripts/     ← 辅助脚本                  │
+│ assets/      ← 资源文件                  │
+└─────────────────────────────────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│ skill_manage(            │
+│   action='write_file',   │
+│   file_path='references/ │
+│     api.md',             │
+│   file_content='...'     │
+│ )                        │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│ 路径遍历检查             │
+│ 验证在允许的子目录下     │
+│ 大小限制（1 MiB/文件）   │
+└───────────┬─────────────┘
+            │
+            ▼
+┌─────────────────────────┐
+│ 安全扫描 → 失败则回滚    │
+└─────────────────────────┘
+```
+
+---
+
+## 5. 关键技术特性
+
+### 5.1 渐进式披露（Progressive Disclosure）
+
+| 层级 | 方法 | 返回内容 | Token 消耗 |
+|------|------|----------|------------|
+| Tier 1 | `skills_list()` | name + description + category | 极低 |
+| Tier 2 | `skill_view(name)` | 完整 SKILL.md 内容 | 中等 |
+| Tier 3 | `skill_view(name, file_path)` | 特定支持文件 | 按需 |
+
+### 5.2 平台兼容性
+
+```python
+_PLATFORM_MAP = {
+    "macos": "darwin",
+    "linux": "linux",
+    "windows": "win32",
+}
+
+def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
+    """检查技能是否与当前 OS 平台兼容"""
+    platforms = frontmatter.get("platforms")
+    if not platforms:
+        return True  # 省略 = 所有平台（向后兼容默认值）
+    
+    current = sys.platform
+    for platform in platforms:
+        normalized = str(platform).lower().strip()
+        mapped = PLATFORM_MAP.get(normalized, normalized)
+        if current.startswith(mapped):
+            return True
+    return False
+```
+
+### 5.3 环境变量与密钥管理
+
+```python
+def _capture_required_environment_variables(
+    skill_name: str,
+    missing_entries: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """捕获技能需要的环境变量"""
+    # 1. 检查是否已持久化（在 .env 或系统环境中）
+    # 2. 如果是 Gateway 表面，返回设置提示
+    # 3. 否则调用密钥捕获回调，交互式收集
+    # 4. 记录缺失的名称和跳过状态
+    
+    for entry in missing_entries:
+        callback_result = _secret_capture_callback(
+            entry["name"],
+            entry["prompt"],
+            {"skill_name": skill_name, "help": entry.get("help")},
+        )
+        # 成功则继续，失败则标记为跳过
+```
+
+### 5.4 技能索引与缓存
+
+```python
+# 远程索引缓存
+INDEX_CACHE_TTL = 3600  # 1 小时
+
+def _read_cache(self, cache_key: str) -> Optional[List[Dict]]:
+    """读取缓存的远程索引"""
+    cache_file = INDEX_CACHE_DIR / f"{cache_key}.json"
+    if not cache_file.exists():
+        return None
+    
+    cache_data = json.loads(cache_file.read_text())
+    if time.time() - cache_data["timestamp"] > INDEX_CACHE_TTL:
+        return None  # 缓存过期
+    
+    return cache_data["skills"]
+
+def _write_cache(self, cache_key: str, skills: List[Dict]):
+    """写入远程索引缓存"""
+    cache_file = INDEX_CACHE_DIR / f"{cache_key}.json"
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache_data = {
+        "timestamp": time.time(),
+        "skills": skills,
+    }
+    cache_file.write_text(json.dumps(cache_data))
+```
+
+### 5.5 技能配置注入
+
+```python
+def _inject_skill_config(loaded_skill: dict, parts: list) -> None:
+    """将技能声明的配置值注入到消息部分"""
+    # 1. 解析 SKILL.md 的 frontmatter
+    # 2. 提取 metadata.hermes.config 变量
+    # 3. 从 config.yaml 解析当前值
+    # 4. 注入为 [Skill config: key = value] 块
+    
+    frontmatter, _ = parse_frontmatter(raw_content)
+    config_vars = extract_skill_config_vars(frontmatter)
+    resolved = resolve_skill_config_values(config_vars)
+    
+    lines = ["", f"[Skill config (from {display_hermes_home()}/config.yaml):"]
+    for key, value in resolved.items():
+        display_val = str(value) if value else "(not set)"
+        lines.append(f"  {key} = {display_val}")
+    lines.append("]")
+    parts.extend(lines)
+```
+
+---
+
+## 6. 安全机制总结
+
+| 机制 | 说明 |
+|------|------|
+| **威胁模式扫描** | 60+ 正则模式检测数据泄露、提示注入、破坏操作、持久化、网络、混淆 |
+| **信任级别** | builtin > trusted > community > agent-created，不同级别不同策略 |
+| **路径遍历防护** | 禁止 `..` 路径，限制在允许的子目录下 |
+| **原子写入** | 临时文件 + os.replace()，保证不部分写入 |
+| **回滚机制** | 安全扫描失败时自动回滚到原始内容 |
+| **内容大小限制** | SKILL.md ≤ 100,000 字符，支持文件 ≤ 1 MiB |
+| **隔离区** | Hub 下载的技能先进入 `.hub/quarantine/` 再扫描安装 |
+| **审计日志** | 所有 Hub 操作记录到 `.hub/audit.log` |
+
+---
+
+## 7. 与 pi-coding-agent 的集成建议
+
+### 7.1 最小可行实现
+
+```python
+# 1. 定义技能目录结构
+SKILLS_DIR = Path.home() / ".pi-coding-agent" / "skills"
+
+# 2. 实现技能扫描
+def scan_skills() -> List[Dict]:
+    skills = []
+    for skill_md in SKILLS_DIR.rglob("SKILL.md"):
+        frontmatter, body = parse_frontmatter(skill_md.read_text())
+        skills.append({
+            "name": frontmatter.get("name", skill_md.parent.name),
+            "description": frontmatter.get("description", ""),
+            "path": str(skill_md),
+        })
     return skills
 
+# 3. 实现技能创建（带安全扫描）
+def create_skill(name: str, content: str) -> Dict:
+    skill_dir = SKILLS_DIR / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 原子写入
+    skill_md = skill_dir / "SKILL.md"
+    _atomic_write(skill_md, content)
+    
+    # 安全扫描
+    if scan_for_threats(skill_dir):
+        shutil.rmtree(skill_dir)
+        return {"success": False, "error": "Security scan failed"}
+    
+    return {"success": True, "path": str(skill_dir)}
 
-def _parse_frontmatter(content: str) -> tuple:
-    """Parse YAML frontmatter."""
-    frontmatter = {}
-    body = content
-    
-    if not content.startswith("---"):
-        return frontmatter, body
-    
-    import re
-    end_match = re.search(r"\n---\s*\n", content[3:])
-    if not end_match:
-        return frontmatter, body
-    
-    yaml_content = content[3:end_match.start() + 3]
-    body = content[end_match.end() + 3:]
-    
-    try:
-        import yaml
-        parsed = yaml.safe_load(yaml_content)
-        if isinstance(parsed, dict):
-            frontmatter = parsed
-    except Exception:
-        pass
-    
-    return frontmatter, body
+# 4. 实现渐进式披露
+def skills_list():
+    return json.dumps({"skills": scan_skills()})
 
-
-def _get_category_from_path(skill_path: Path) -> str:
-    """Extract category from skill path."""
-    try:
-        rel_path = skill_path.relative_to(SKILLS_DIR)
-        parts = rel_path.parts
-        if len(parts) >= 3:
-            return parts[0]
-    except ValueError:
-        pass
-    return None
+def skill_view(name: str, file_path: str = None):
+    skill = find_skill(name)
+    if file_path:
+        return (skill["path"] / file_path).read_text()
+    return skill["path"].read_text()
 ```
 
-#### 3. 技能审查工具
+### 7.2 完整实现路线图
 
-```python
-# pi-coding-agent/tools/skill_review_tool.py
-
-import json
-import logging
-import threading
-from typing import Dict, Any, List, Optional
-
-logger = logging.getLogger(__name__)
-
-MAX_DEPTH = 2
-SKILL_REVIEW_INTERVAL = 10
-
-
-class SkillReviewTool:
-    """Skill review tool for pi-coding-agent."""
-    
-    def __init__(self, agent):
-        self.agent = agent
-        self._iters_since_skill = 0
-        self._skill_nudge_interval = SKILL_REVIEW_INTERVAL
-    
-    def maybe_trigger_review(self, function_name: str, messages_snapshot: List[Dict]) -> None:
-        """Maybe trigger skill review based on iteration count."""
-        if function_name == "skill_manage":
-            self._iters_since_skill = 0
-            return
-        
-        self._iters_since_skill += 1
-        
-        if (self._skill_nudge_interval > 0
-                and self._iters_since_skill >= self._skill_nudge_interval
-                and "skill_manage" in self.agent.valid_tool_names):
-            self._iters_since_skill = 0
-            self._spawn_background_review(messages_snapshot)
-    
-    def _spawn_background_review(self, messages_snapshot: List[Dict]) -> None:
-        """Spawn background thread to review conversation for skill saves."""
-        def _run_review():
-            try:
-                # Create review agent
-                review_agent = self._create_review_agent()
-                
-                # Run review
-                review_agent.run_conversation(
-                    user_message=self._get_skill_review_prompt(),
-                    conversation_history=messages_snapshot,
-                )
-                
-                # Scan for skill actions
-                actions = []
-                for msg in getattr(review_agent, "_session_messages", []):
-                    if not isinstance(msg, dict) or msg.get("role") != "tool":
-                        continue
-                    try:
-                        data = json.loads(msg.get("content", "{}"))
-                    except Exception:
-                        continue
-                    if not data.get("success"):
-                        continue
-                    message = data.get("message", "")
-                    if "created" in message.lower() or "updated" in message.lower():
-                        actions.append(message)
-                
-                if actions:
-                    summary = " · ".join(dict.fromkeys(actions))
-                    self.agent._safe_print(f"  💾 {summary}")
-            
-            except Exception as e:
-                logger.debug(f"Background skill review failed: {e}")
-        
-        t = threading.Thread(target=_run_review, daemon=True, name="bg-skill-review")
-        t.start()
-    
-    def _create_review_agent(self):
-        """Create a review agent."""
-        from pi_agent_sdk.agent import Agent as PI-Agent
-        
-        review_agent = PI-Agent(
-            model=self.agent.model,
-            max_iterations=8,
-            quiet_mode=True,
-            platform=self.agent.platform,
-            provider=self.agent.provider,
-        )
-        
-        # Copy memory settings
-        review_agent._memory_store = self.agent._memory_store
-        review_agent._memory_enabled = self.agent._memory_enabled
-        review_agent._user_profile_enabled = self.agent._user_profile_enabled
-        
-        return review_agent
-    
-    def _get_skill_review_prompt(self) -> str:
-        """Get skill review prompt."""
-        return (
-            "Review the conversation above and consider saving or updating a skill if appropriate.\n\n"
-            "Focus on: was a non-trivial approach used to complete a task that required trial "
-            "and error, or changing course due to experiential findings along the way, or did "
-            "the user expect or desire a different method or outcome?\n\n"
-            "If a relevant skill already exists, update it with what you learned. "
-            "Otherwise, create a new skill if the approach is reusable.\n"
-            "If nothing is worth saving, just say 'Nothing to save.' and stop."
-        )
-```
-
-#### 4. 集成到 pi-coding-agent
-
-```python
-# pi-coding-agent/agent/agent.py
-
-from tools.skill_manager_tool import skill_manage
-from tools.skills_list_tool import skills_list
-from tools.skill_review_tool import SkillReviewTool
-
-
-class PI-Agent:
-    """PI-Coding-Agent with skill management."""
-    
-    def __init__(self, ...):
-        # ... existing code ...
-        
-        # Register skill management tools
-        self._register_tool(
-            name="skill_manage",
-            toolset="skills",
-            schema={
-                "name": "skill_manage",
-                "description": "Manage user-created skills (create, edit, patch, delete, write_file, remove_file)",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "action": {"type": "string", "enum": ["create", "edit", "patch", "delete", "write_file", "remove_file"]},
-                        "name": {"type": "string"},
-                        "content": {"type": "string"},
-                        "category": {"type": "string"},
-                        "file_path": {"type": "string"},
-                        "file_content": {"type": "string"},
-                        "old_string": {"type": "string"},
-                        "new_string": {"type": "string"},
-                        "replace_all": {"type": "boolean"},
-                    },
-                    "required": ["action", "name"],
-                },
-            },
-            handler=self._skill_manage_handler,
-        )
-        
-        # Register skills list tool
-        self._register_tool(
-            name="skills_list",
-            toolset="skills",
-            schema={
-                "name": "skills_list",
-                "description": "List all available skills with metadata",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-            handler=lambda **kwargs: json.dumps(skills_list(), ensure_ascii=False),
-        )
-        
-        # Initialize skill review tool
-        self._skill_review_tool = SkillReviewTool(self)
-    
-    def _skill_manage_handler(self, **kwargs) -> str:
-        """Handle skill_manage tool calls."""
-        result = skill_manage(**kwargs)
-        return json.dumps(result, ensure_ascii=False)
-    
-    def _on_tool_call(self, function_name: str, **kwargs):
-        """Called after each tool call."""
-        # ... existing code ...
-        
-        # Trigger skill review if needed
-        if hasattr(self, '_skill_review_tool'):
-            messages_snapshot = self._get_messages_snapshot()
-            self._skill_review_tool.maybe_trigger_review(function_name, messages_snapshot)
-```
+| 阶段 | 内容 |
+|------|------|
+| Phase 1 | 基础技能扫描 + SKILL.md 解析 |
+| Phase 2 | 技能创建/编辑/删除 + 原子写入 |
+| Phase 3 | 安全扫描（威胁模式检测） |
+| Phase 4 | 渐进式披露 + 支持文件管理 |
+| Phase 5 | 技能 Hub 集成（GitHub 源适配器） |
+| Phase 6 | 技能同步 + Manifest 机制 |
+| Phase 7 | 斜杠命令注册 + 配置注入 |
+| Phase 8 | 平台兼容性 + 环境变量管理 |
 
 ---
 
-## 七、总结
+## 8. 总结
 
-### 7.1 核心创新
+Hermes Agent 的 Skills 自我学习系统是一个**生产级**的技能生命周期管理框架，核心优势：
 
-1. **自动提炼**：Agent 在完成复杂任务后，自动评估是否值得创建技能
-2. **程序性记忆**：技能是"如何做"的流程性知识，而不是"是什么"的事实性知识
-3. **安全审查**：所有 Agent 创建的技能都经过安全扫描
-4. **渐进式更新**：支持创建、编辑、补丁（patch）、删除等多种操作
-5. **后台审查**：使用独立的 review agent 进行后台技能审查，不阻塞主流程
+1. **渐进式披露**：最小化 token 消耗，按需加载
+2. **单一事实源**：所有技能统一管理，避免碎片化
+3. **安全优先**：多层扫描 + 信任级别 + 回滚机制
+4. **可扩展**：插件化源适配器 + 外部技能目录
+5. **原子操作**：保证数据一致性
+6. **平台兼容**：跨 OS 支持 + 条件激活
+7. **配置注入**：技能声明配置，系统自动解析
+8. **同步机制**：Manifest 跟踪 + 用户修改保护
 
-### 7.2 设计哲学
-
-- **渐进式披露**：先显示元数据，按需加载完整内容
-- **原子操作**：所有文件写入都是原子的，防止损坏
-- **安全优先**：所有技能都经过安全扫描
-- **非阻塞审查**：使用后台线程进行审查，不阻塞主流程
-- **灵活更新**：支持多种更新方式（patch/edit/create）
-
-### 7.3 与 pi-coding-agent 的集成要点
-
-1. **技能管理工具**：实现 create、edit、patch、delete、write_file、remove_file
-2. **技能列表工具**：实现 skills_list()，仅返回元数据
-3. **技能审查工具**：实现后台审查线程
-4. **迭代计数器**：跟踪迭代次数，触发审查
-5. **工具注册**：注册 skill_manage 和 skills_list 工具
-
----
-
-## 八、参考资料
-
-### 官方文档
-- [Skills System](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills.md)
-- [Working with Skills](https://hermes-agent.nousresearch.com/docs/guides/work-with-skills.md)
-- [Build a Hermes Plugin](https://hermes-agent.nousresearch.com/docs/guides/build-a-hermes-plugin.md)
-
-### 源码
-- [skill_manager_tool.py](file:///Users/saga/code-repos/PI-Coding-Agent-OpenClaw-study/hermes-agent-source-code/tools/skill_manager_tool.py)
-- [skills_tool.py](file:///Users/saga/code-repos/PI-Coding-Agent-OpenClaw-study/hermes-agent-source-code/tools/skills_tool.py)
-- [skill_utils.py](file:///Users/saga/code-repos/PI-Coding-Agent-OpenClaw-study/hermes-agent-source-code/agent/skill_utils.py)
-- [run_agent.py](file:///Users/saga/code-repos/PI-Coding-Agent-OpenClaw-study/hermes-agent-source-code/run_agent.py) (skill review lines 2268-2376)
-
----
-
-**文档完成日期**: 2026-04-16  
-**作者**: AI Assistant
+这套系统使 Agent 能够**从经验中学习**，将成功的方法转化为可复用的技能，并在后续任务中自动发现和应用。

@@ -1,47 +1,71 @@
 # Hermes Agent Multi-Agent 委托与协调系统研究
 
-**研究日期**: 2026-04-16  
-**研究对象**: Hermes Agent 的 `delegate_task` 工具和 Subagent 架构
+## 1. 概述
 
----
+Hermes Agent 实现了一个完整的 Multi-Agent 委托与协调系统，通过 `delegate_task` 工具实现主-子 Agent 的任务分发、并行执行、结果聚合和中断传播。该系统支持单任务委托和批量并行模式，每个子 Agent 拥有独立的会话、工具集和终端环境。
 
-## 执行摘要
+## 2. 核心架构
 
-Hermes Agent 的 Multi-Agent 委托系统是其最强大的功能之一，允许主 Agent 自动或手动创建隔离的子 Agent 来并行处理任务。这个系统的核心创新在于：
+### 2.1 架构层次
 
-1. **隔离的上下文**：子 Agent 从零开始，没有父 Agent 的对话历史
-2. **并行执行**：最多 3 个子 Agent 同时运行
-3. **受限的工具集**：子 Agent 无法调用危险工具（memory、clarify、delegation）
-4. **凭证池共享**：子 Agent 继承父 Agent 的 API 凭证池，实现速率限制恢复
-5. **中断传播**：父 Agent 中断会自动中断所有子 Agent
-6. **深度限制**：防止无限递归（最大深度 2）
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    主 Agent (Parent Agent)                     │
+│  - 用户交互                                                    │
+│  - 任务分解                                                    │
+│  - 结果聚合                                                    │
+│  - 中断传播                                                    │
+└──────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────┐
+│              delegate_task 工具 (协调器)                       │
+│  - 子 Agent 构建 (_build_child_agent)                         │
+│  - 并行执行 (_run_single_child + ThreadPoolExecutor)          │
+│  - 结果收集与排序                                              │
+│  - 进度显示 (_build_child_progress_callback)                  │
+└──────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────┐
+│                    子 Agent (Child Agent)                      │
+│  - 独立会话 (skip_context_files=True, skip_memory=True)       │
+│  - 受限工具集 (DELEGATE_BLOCKED_TOOLS)                         │
+│  - 专注系统提示 (_build_child_system_prompt)                  │
+│  - 深度限制 (MAX_DEPTH=2)                                     │
+└──────────────────────────────────────────────────────────────┘
+```
 
-这个系统让 Hermes 能够处理复杂的多步骤任务，同时保持每个子任务的上下文清晰和高效。
+### 2.2 核心文件
 
----
+- [delegate_tool.py](file:///Users/saga/code-repos/PI-Coding-Agent-OpenClaw-study/hermes-agent-source-code/tools/delegate_tool.py) - 委托工具实现
+- [run_agent.py](file:///Users/saga/code-repos/PI-Coding-Agent-OpenClaw-study/hermes-agent-source-code/run_agent.py#L781-L782) - 主 Agent 中断传播支持
+- [subagent-driven-development/SKILL.md](file:///Users/saga/code-repos/PI-Coding-Agent-OpenClaw-study/hermes-agent-source-code/skills/software-development/subagent-driven-development/SKILL.md) - 子 Agent 驱动开发技能
 
-## 一、核心概念
+## 3. delegate_task 工具实现机制
 
-### 1.1 Subagent 的本质
+### 3.1 工具签名
 
-Subagent（子 Agent）是**完全隔离的 AIAgent 实例**，具有：
+```python
+DELEGATE_TASK_SCHEMA = {
+    "name": "delegate_task",
+    "description": "Spawn one or more subagents to work on tasks in isolated contexts...",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "goal": {"type": "string", "description": "What the subagent should accomplish..."},
+            "context": {"type": "string", "description": "Additional context for the subagent..."},
+            "toolsets": {"type": "array", "items": {"type": "string"}, "description": "Toolsets available to the subagent..."},
+            "tasks": {"type": "array", "items": {"object"}, "description": "Batch mode: array of task objects..."},
+            "max_iterations": {"type": "integer", "description": "Maximum iterations for each subagent..."},
+            "acp_command": {"type": "string", "description": "ACP command override..."},
+            "acp_args": {"type": "array", "items": {"string"}, "description": "ACP arguments override..."},
+        },
+    },
+}
+```
 
-| 特性 | 说明 |
-|------|------|
-| **独立的上下文** | 从零开始，没有父 Agent 的对话历史 |
-| **独立的会话** | 每个子 Agent 有自己的 session_id 和终端会话 |
-| **受限的工具集** | 自动过滤危险工具（memory、clarify、delegation 等） |
-| **独立的迭代预算** | 每个子 Agent 有自己的 max_iterations（默认 50） |
-| **独立的进度回调** | 子 Agent 的工具调用实时显示在父 Agent 的终端 |
+### 3.2 两种执行模式
 
-**关键设计原则**：
-- Subagent 不知道父 Agent 的任何信息（除了明确传递的 goal 和 context）
-- Subagent 的工作是**专注于单一任务**，完成后返回结构化摘要
-- 父 Agent 的上下文**只包含委托调用和摘要结果**，不包含中间工具调用
-
-### 1.2 委托的两种模式
-
-#### 单任务模式（Single Task）
+**单任务模式：**
 
 ```python
 delegate_task(
@@ -51,12 +75,7 @@ delegate_task(
 )
 ```
 
-**特点**：
-- 直接运行，无需线程池
-- 适合需要完整上下文的复杂任务
-- 阻塞直到完成
-
-#### 批量模式（Batch / Parallel）
+**批量并行模式：**
 
 ```python
 delegate_task(tasks=[
@@ -66,278 +85,144 @@ delegate_task(tasks=[
 ])
 ```
 
-**特点**：
-- 使用 `ThreadPoolExecutor` 并行执行
-- 最多 3 个并发子 Agent（可配置）
-- 结果按任务索引排序，不按完成顺序
+### 3.3 执行流程
 
----
-
-## 二、实现细节
-
-### 2.1 核心数据结构
-
-#### 深度限制
-
-```python
-MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
+```
+delegate_task() 入口
+    ↓
+1. 深度检查 (depth >= MAX_DEPTH=2 → 拒绝)
+    ↓
+2. 加载配置 (_load_config)
+    ↓
+3. 解析凭证 (_resolve_delegation_credentials)
+    ↓
+4. 规范化任务列表 (单任务 → 列表，批量 → 截断到 max_children)
+    ↓
+5. 保存父工具名称 (_parent_tool_names = _last_resolved_tool_names)
+    ↓
+6. 构建所有子 Agent (_build_child_agent)
+    ↓
+7. 恢复父工具名称 (_last_resolved_tool_names = _parent_tool_names)
+    ↓
+8. 执行：
+   - 单任务：直接运行 _run_single_child
+   - 批量：ThreadPoolExecutor 并行执行
+    ↓
+9. 结果排序 (按 task_index)
+    ↓
+10. 通知 Memory Provider (_memory_manager.on_delegation)
+    ↓
+11. 返回 JSON 结果
 ```
 
-```python
-# run_agent.py (line 780)
-self._delegate_depth = 0  # 0 = top-level agent, incremented for children
-```
-
-**作用**：防止无限递归委托
-
-#### 活跃子 Agent 管理
+### 3.4 被禁止的工具
 
 ```python
-# run_agent.py (line 781-782)
-self._active_children = []      # Running child AIAgents
-self._active_children_lock = threading.Lock()
+DELEGATE_BLOCKED_TOOLS = frozenset([
+    "delegate_task",   # 防止递归委托
+    "clarify",         # 子 Agent 不能与用户交互
+    "memory",          # 不能写入共享 MEMORY.md
+    "send_message",    # 不能跨平台发送消息
+    "execute_code",    # 子 Agent 应逐步推理，而非写脚本
+])
 ```
 
-**作用**：
-- 跟踪所有活跃的子 Agent
-- 支持中断传播
-- 会话结束时清理子 Agent
-
-### 2.2 子 Agent 构建流程
+**被禁止的工具集：**
 
 ```python
-def _build_child_agent(
-    task_index: int,
-    goal: str,
-    context: Optional[str],
-    toolsets: Optional[List[str]],
-    model: Optional[str],
-    max_iterations: int,
-    parent_agent,
-    # Credential overrides
-    override_provider: Optional[str] = None,
-    override_base_url: Optional[str] = None,
-    override_api_key: Optional[str] = None,
-    ...
-) -> AIAgent:
+blocked_toolset_names = {
+    "delegation", "clarify", "memory", "code_execution",
+}
 ```
 
-**构建步骤**：
+## 4. 子 Agent 会话隔离与状态传递
 
-1. **工具集继承与过滤**
+### 4.1 会话隔离机制
+
+子 Agent 通过以下参数实现完全隔离：
+
+```python
+child = AIAgent(
+    # ... 其他参数 ...
+    skip_context_files=True,      # 不加载上下文文件
+    skip_memory=True,             # 不加载 Memory 系统
+    quiet_mode=True,              # 静默模式
+    ephemeral_system_prompt=child_prompt,  # 临时系统提示
+    log_prefix=f"[subagent-{task_index}]",  # 日志前缀
+    iteration_budget=None,        # 每个子 Agent 独立预算
+    thinking_callback=child_thinking_cb,    # 思考回调
+    tool_progress_callback=child_progress_cb,  # 进度回调
+)
+```
+
+### 4.2 状态传递机制
+
+**父 → 子传递的信息：**
+
+1. **API 凭证**：
    ```python
-   # 从父 Agent 继承工具集
-   parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
-   
-   # 过滤掉被阻止的工具集
-   child_toolsets = _strip_blocked_tools(toolsets)
-   ```
-
-2. **系统提示构建**
-   ```python
-   child_prompt = _build_child_system_prompt(goal, context, workspace_path=workspace_hint)
-   ```
-
-3. **凭证继承**
-   ```python
-   # 继承父 Agent 的 API key
-   parent_api_key = getattr(parent_agent, "api_key", None)
-   
-   # 或使用委托配置的覆盖
+   effective_base_url = override_base_url or parent_agent.base_url
+   effective_api_key = override_api_key or parent_api_key
    effective_provider = override_provider or getattr(parent_agent, "provider", None)
    ```
 
-4. **凭证池共享**
+2. **工具集**：
+   ```python
+   # 子 Agent 工具集 = 父工具集 ∩ 请求工具集 - 被禁止工具
+   child_toolsets = _strip_blocked_tools([t for t in toolsets if t in parent_toolsets])
+   ```
+
+3. **推理配置**：
+   ```python
+   parent_reasoning = getattr(parent_agent, "reasoning_config", None)
+   child_reasoning = parent_reasoning  # 可被 delegation.reasoning_effort 覆盖
+   ```
+
+4. **工作目录提示**：
+   ```python
+   workspace_hint = _resolve_workspace_hint(parent_agent)
+   # 注入到子 Agent 系统提示中
+   ```
+
+5. **凭证池共享**：
    ```python
    child_pool = _resolve_child_credential_pool(effective_provider, parent_agent)
    if child_pool is not None:
        child._credential_pool = child_pool
    ```
 
-5. **进度回调设置**
+6. **ACP 配置**：
    ```python
-   child_progress_cb = _build_child_progress_callback(task_index, parent_agent)
+   effective_acp_command = override_acp_command or getattr(parent_agent, "acp_command", None)
+   effective_acp_args = list(override_acp_args or (getattr(parent_agent, "acp_args", []) or []))
    ```
 
-6. **子 Agent 实例化**
-   ```python
-   child = AIAgent(
-       base_url=effective_base_url,
-       api_key=effective_api_key,
-       model=effective_model,
-       provider=effective_provider,
-       max_iterations=max_iterations,
-       enabled_toolsets=child_toolsets,
-       quiet_mode=True,  # 不输出到用户界面
-       ephemeral_system_prompt=child_prompt,  # 临时系统提示
-       log_prefix=f"[subagent-{task_index}]",
-       tool_progress_callback=child_progress_cb,
-       ...
-   )
-   child._delegate_depth = parent_agent._delegate_depth + 1
-   ```
-
-### 2.3 被阻止的工具
+**子 → 父返回的信息：**
 
 ```python
-DELEGATE_BLOCKED_TOOLS = frozenset([
-    "delegate_task",   # no recursive delegation
-    "clarify",         # no user interaction
-    "memory",          # no writes to shared MEMORY.md
-    "send_message",    # no cross-platform side effects
-    "execute_code",    # children should reason step-by-step, not write scripts
-])
+{
+    "task_index": 0,
+    "status": "completed",  # completed/failed/error/interrupted
+    "summary": "...",       # 子 Agent 最终响应
+    "api_calls": 15,
+    "duration_seconds": 42.5,
+    "model": "gpt-4o",
+    "exit_reason": "completed",  # completed/max_iterations/interrupted
+    "tokens": {
+        "input": 12345,
+        "output": 6789,
+    },
+    "tool_trace": [  # 工具调用追踪
+        {"tool": "read_file", "args_bytes": 45, "result_bytes": 1234, "status": "ok"},
+        {"tool": "run_command", "args_bytes": 67, "result_bytes": 890, "status": "ok"},
+    ],
+}
 ```
 
-**原因**：
-- `delegate_task`：防止无限递归
-- `clarify`：子 Agent 不能与用户交互
-- `memory`：子 Agent 不能写入共享记忆
-- `send_message`：子 Agent 不能发送跨平台消息
-- `execute_code`：子 Agent 应该逐步推理，而不是写脚本
-
-### 2.4 并行执行机制
+### 4.3 系统提示构建
 
 ```python
-# tools/delegate_tool.py (line 350-360)
-_DEFAULT_MAX_CONCURRENT_CHILDREN = 3
-
-def _get_max_concurrent_children() -> int:
-    """Read delegation.max_concurrent_children from config, falling back to
-    DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (3)."""
-    cfg = _load_config()
-    val = cfg.get("max_concurrent_children")
-    if val is not None:
-        try:
-            return max(1, int(val))
-        except (TypeError, ValueError):
-            logger.warning("Invalid max_concurrent_children, using default 3")
-    env_val = os.getenv("DELEGATION_MAX_CONCURRENT_CHILDREN")
-    if env_val:
-        try:
-            return max(1, int(env_val))
-        except (TypeError, ValueError):
-            pass
-    return _DEFAULT_MAX_CONCURRENT_CHILDREN
-```
-
-**执行流程**：
-```python
-# 批量模式使用 ThreadPoolExecutor
-with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
-    futures = []
-    for task_index, task in enumerate(tasks):
-        child = _build_child_agent(...)
-        future = executor.submit(_run_single_child, task_index, goal, child, parent_agent)
-        futures.append(future)
-    
-    # 收集结果（按任务索引排序）
-    results = []
-    for future in as_completed(futures):
-        result = future.result()
-        results.append(result)
-    
-    # 按任务索引排序
-    results.sort(key=lambda x: x['task_index'])
-```
-
-### 2.5 进度回调与显示
-
-#### CLI 模式
-
-```python
-def _build_child_progress_callback(task_index: int, parent_agent, task_count: int = 1):
-    spinner = getattr(parent_agent, '_delegate_spinner', None)
-    
-    def _callback(event_type: str, tool_name: str = None, preview: str = None, ...):
-        prefix = f"[{task_index + 1}] " if task_count > 1 else ""
-        
-        if event_type == "tool.started" and spinner:
-            emoji = get_tool_emoji(tool_name)
-            line = f" {prefix}├─ {emoji} {tool_name}"
-            if preview:
-                line += f"  \"{preview[:35]}...\""
-            spinner.print_above(line)
-```
-
-**显示效果**：
-```
-[1] 🔀 Researching WebAssembly...
-    ├─ 🔍 web_search "WebAssembly 2025 outside browser"
-    ├─ 🔍 web_search "Wasmtime Wasmer runtimes"
-[2] 🔀 Researching RISC-V...
-    ├─ 🔍 web_search "RISC-V server chips 2025"
-    ├─ 🔍 web_search "cloud providers adopting RISC-V"
-```
-
-#### Gateway 模式
-
-```python
-def _callback(event_type: str, tool_name: str = None, ...):
-    if parent_cb:
-        _batch.append(tool_name)
-        if len(_batch) >= _BATCH_SIZE:
-            summary = ", ".join(_batch)
-            parent_cb("subagent_progress", f"🔀 {prefix}{summary}")
-            _batch.clear()
-```
-
-### 2.6 心跳机制
-
-```python
-_HEARTBEAT_INTERVAL = 30  # seconds
-
-def _heartbeat_loop():
-    """Periodically propagate child activity to parent to prevent gateway timeout."""
-    while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
-        touch = getattr(parent_agent, '_touch_activity', None)
-        if touch:
-            child_summary = child.get_activity_summary()
-            child_tool = child_summary.get("current_tool")
-            child_iter = child_summary.get("api_call_count", 0)
-            child_max = child_summary.get("max_iterations", 0)
-            desc = f"delegate_task: subagent {task_index} working"
-            if child_tool:
-                desc = f"delegate_task: subagent running {child_tool} (iteration {child_iter}/{child_max})"
-            touch(desc)
-```
-
-**作用**：防止 Gateway 的 inactivity timeout 在子 Agent 工作时触发
-
-### 2.7 凭证池共享
-
-```python
-def _resolve_child_credential_pool(provider: Optional[str], parent_agent):
-    """Share parent's credential pool with child when possible."""
-    parent_pool = getattr(parent_agent, '_credential_pool', None)
-    if parent_pool is None:
-        return None
-    
-    # Child inherits parent's pool for the same provider
-    return parent_pool
-```
-
-**作用**：
-- 子 Agent 可以在父 Agent 的 API key 之间轮换
-- 避免单个 key 的速率限制影响所有子 Agent
-- 提高整体的容错性
-
----
-
-## 三、核心特性
-
-### 3.1 上下文隔离
-
-**问题**：如果子 Agent 知道父 Agent 的对话历史，会出现什么问题？
-
-1. **上下文污染**：子 Agent 可能被父 Agent 的讨论分散注意力
-2. **信息过载**：子 Agent 需要处理不必要的历史信息
-3. **假设偏差**：子 Agent 可能假设父 Agent 已经讨论过的内容
-
-**解决方案**：
-```python
-# 子 Agent 的系统提示完全由 goal 和 context 构建
-def _build_child_system_prompt(goal: str, context: Optional[str], ...) -> str:
+def _build_child_system_prompt(goal, context, workspace_path=None):
     parts = [
         "You are a focused subagent working on a specific delegated task.",
         "",
@@ -345,61 +230,250 @@ def _build_child_system_prompt(goal: str, context: Optional[str], ...) -> str:
     ]
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
-    # ... 没有父 Agent 的对话历史！
+    if workspace_path and str(workspace_path).strip():
+        parts.append(f"\nWORKSPACE PATH:\n{workspace_path}\n...")
+    parts.append(
+        "\nComplete this task using the tools available to you. "
+        "When finished, provide a clear, concise summary of:\n"
+        "- What you did\n"
+        "- What you found or accomplished\n"
+        "- Any files you created or modified\n"
+        "- Any issues encountered\n\n"
+        "Important workspace rule: Never assume a repository lives at /workspace/..."
+    )
     return "\n".join(parts)
 ```
 
-**最佳实践**：
-```python
-# BAD - 子 Agent 无法理解
-delegate_task(goal="Fix the bug we were discussing")
+## 5. 主-子 Agent 间的任务分解策略
 
-# GOOD - 子 Agent 有完整的上下文
-delegate_task(
-    goal="Fix the TypeError in api/handlers.py line 47",
-    context="""The error is: 'NoneType' object has no attribute 'get'.
-    The function process_request() receives a dict from parse_body(),
-    but parse_body() returns None when Content-Type is missing."""
+### 5.1 任务分解原则
+
+根据 [subagent-driven-development/SKILL.md](file:///Users/saga/code-repos/PI-Coding-Agent-OpenClaw-study/hermes-agent-source-code/skills/software-development/subagent-driven-development/SKILL.md)，任务分解遵循以下原则：
+
+1. **每个任务 = 2-5 分钟专注工作**
+2. **任务粒度适中**：
+   - ❌ 太大："实现用户认证系统"
+   - ✅ 合适："创建 User 模型，包含 email 和 password 字段"
+3. **上下文完整**：子 Agent 对父对话零知识，必须传递所有必要信息
+
+### 5.2 两阶段审查流程
+
+```
+计划读取 → 任务提取 → Todo 列表
+    ↓
+对于每个任务：
+    1. 派遣实现者子 Agent (delegate_task)
+    2. 派遣规范合规审查者 (delegate_task)
+       - 如果发现问题 → 修复 → 重新审查
+    3. 派遣代码质量审查者 (delegate_task)
+       - 如果发现问题 → 修复 → 重新审查
+    4. 标记任务完成
+    ↓
+最终集成审查 (delegate_task)
+    ↓
+验证并提交
+```
+
+### 5.3 并行任务分解
+
+```python
+# 模式 1：并行研究
+delegate_task(tasks=[
+    {"goal": "研究 WebAssembly 现状", "toolsets": ["web"]},
+    {"goal": "研究 RISC-V 采用情况", "toolsets": ["web"]},
+    {"goal": "研究量子计算进展", "toolsets": ["web"]}
+])
+
+# 模式 2：多文件重构
+delegate_task(tasks=[
+    {"goal": "重构 API 端点处理器", "toolsets": ["terminal", "file"]},
+    {"goal": "更新客户端 SDK 方法", "toolsets": ["terminal", "file"]},
+    {"goal": "更新 API 文档", "toolsets": ["terminal", "file"]}
+])
+
+# 模式 3：收集 + 分析
+execute_code("...")  # 机械数据收集
+delegate_task(       # 推理密集型分析
+    goal="分析 AI 融资数据并撰写市场报告",
+    context="原始数据在 /tmp/ai-funding-data.json...",
+    toolsets=["terminal", "file"]
 )
 ```
 
-### 3.2 工具集限制
+## 6. 并行执行机制
 
-**被阻止的工具集**：
+### 6.1 线程池执行
+
 ```python
-_EXCLUDED_TOOLSET_NAMES = frozenset({
-    "debugging", "safe", "delegation", "moa", "rl"
-})
+max_children = _get_max_concurrent_children()  # 默认 3
+
+with ThreadPoolExecutor(max_workers=max_children) as executor:
+    futures = {}
+    for i, t, child in children:
+        future = executor.submit(
+            _run_single_child,
+            task_index=i,
+            goal=t["goal"],
+            child=child,
+            parent_agent=parent_agent,
+        )
+        futures[future] = i
+
+    for future in as_completed(futures):
+        entry = future.result()
+        results.append(entry)
+        # 显示进度...
 ```
 
-**被阻止的工具**：
+### 6.2 并发控制
+
+**配置优先级：**
+
+1. `config.yaml` 中的 `delegation.max_concurrent_children`
+2. 环境变量 `DELEGATION_MAX_CONCURRENT_CHILDREN`
+3. 默认值 `3`
+
 ```python
-DELEGATE_BLOCKED_TOOLS = frozenset([
-    "delegate_task",   # 防止递归
-    "clarify",         # 不能与用户交互
-    "memory",          # 不能写入共享记忆
-    "send_message",    # 不能发送跨平台消息
-    "execute_code",    # 应该逐步推理
-])
+def _get_max_concurrent_children() -> int:
+    cfg = _load_config()
+    val = cfg.get("max_concurrent_children")
+    if val is not None:
+        return max(1, int(val))
+    env_val = os.getenv("DELEGATION_MAX_CONCURRENT_CHILDREN")
+    if env_val:
+        return max(1, int(env_val))
+    return _DEFAULT_MAX_CONCURRENT_CHILDREN  # 3
 ```
 
-**工作流程**：
+### 6.3 进度显示
+
+**CLI 模式：**
+
 ```python
-def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
-    blocked_toolset_names = {"delegation", "clarify", "memory", "code_execution"}
-    return [t for t in toolsets if t not in blocked_toolset_names]
+spinner.print_above(f" {prefix}├─ {emoji} {tool_name}  \"{preview}\"")
 ```
 
-### 3.3 中断传播
+**Gateway 模式：**
 
 ```python
-# run_agent.py (line 3058-3065)
-def interrupt(self, message: Optional[str] = None) -> None:
-    # ... 父 Agent 的中断逻辑 ...
+# 批量工具名称，定期刷新
+_batch.append(tool_name or "")
+if len(_batch) >= _BATCH_SIZE:  # 5
+    summary = ", ".join(_batch)
+    parent_cb("subagent_progress", f"🔀 {prefix}{summary}")
+    _batch.clear()
+```
+
+### 6.4 心跳机制
+
+防止网关因"无活动"而杀死 Agent：
+
+```python
+def _heartbeat_loop():
+    while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):  # 30 秒
+        touch = getattr(parent_agent, '_touch_activity', None)
+        if not touch:
+            continue
+        desc = f"delegate_task: subagent {task_index} working"
+        # 获取子 Agent 活动详情...
+        touch(desc)
+
+_heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+_heartbeat_thread.start()
+```
+
+## 7. 结果聚合与冲突处理
+
+### 7.1 结果收集
+
+```python
+results = []
+
+# 单任务模式
+result = _run_single_child(0, goal, child, parent_agent)
+results.append(result)
+
+# 批量模式
+for future in as_completed(futures):
+    entry = future.result()
+    results.append(entry)
+
+# 按 task_index 排序，确保与输入顺序一致
+results.sort(key=lambda r: r["task_index"])
+```
+
+### 7.2 返回格式
+
+```json
+{
+    "results": [
+        {
+            "task_index": 0,
+            "status": "completed",
+            "summary": "子 Agent 1 的总结...",
+            "api_calls": 15,
+            "duration_seconds": 42.5,
+            "model": "gpt-4o",
+            "exit_reason": "completed",
+            "tokens": {"input": 12345, "output": 6789},
+            "tool_trace": [...]
+        },
+        {
+            "task_index": 1,
+            "status": "completed",
+            "summary": "子 Agent 2 的总结...",
+            ...
+        }
+    ],
+    "total_duration_seconds": 45.2
+}
+```
+
+### 7.3 冲突处理策略
+
+**设计原则：**
+
+1. **无嵌套委托**：子 Agent 不能调用 `delegate_task`，防止递归
+2. **深度限制**：`MAX_DEPTH = 2`（父→子，不能孙）
+3. **工具集隔离**：子 Agent 不能访问父 Agent 的所有工具
+4. **会话隔离**：子 Agent 对父对话零知识
+5. **文件编辑冲突**：文档建议"如果两个子 Agent 可能编辑同一文件，由用户手动处理"
+
+**冲突场景处理：**
+
+| 冲突类型 | 处理方式 |
+|----------|----------|
+| 工具名冲突 | 子 Agent 工具集被过滤，不会冲突 |
+| 文件编辑冲突 | 文档建议避免，用户手动处理 |
+| 终端状态冲突 | 每个子 Agent 独立终端会话 |
+| 凭证冲突 | 共享凭证池，租赁机制 |
+
+## 8. 中断传播机制
+
+### 8.1 子 Agent 注册
+
+```python
+# 在 _build_child_agent 中
+if hasattr(parent_agent, '_active_children'):
+    lock = getattr(parent_agent, '_active_children_lock', None)
+    if lock:
+        with lock:
+            parent_agent._active_children.append(child)
+    else:
+        parent_agent._active_children.append(child)
+```
+
+### 8.2 中断传播
+
+```python
+# 在 run_agent.py 中
+def interrupt(self, message: str = None):
+    # ... 中断当前 Agent ...
     
-    # Propagate interrupt to any running child agents
+    # 传播中断到所有运行中的子 Agent
     with self._active_children_lock:
         children_copy = list(self._active_children)
+    
     for child in children_copy:
         try:
             child.interrupt(message)
@@ -407,823 +481,316 @@ def interrupt(self, message: Optional[str] = None) -> None:
             logger.debug("Failed to propagate interrupt to child agent: %s", e)
 ```
 
-**效果**：
-- 用户发送新消息 → 父 Agent 中断 → 所有子 Agent 中断
-- 防止子 Agent 在用户不再需要时继续工作
-- 节省 API 调用成本
-
-### 3.4 深度限制
+### 8.3 子 Agent 注销
 
 ```python
-# run_agent.py (line 780)
-self._delegate_depth = 0  # parent (0)
-
-# _build_child_agent 中
-child._delegate_depth = getattr(parent_agent, '_delegate_depth', 0) + 1
-
-# run_conversation 中检查
-if child._delegate_depth >= MAX_DEPTH:
-    raise ValueError("Delegation depth limit exceeded")
+# 在 _run_single_child 的 finally 块中
+if hasattr(parent_agent, '_active_children'):
+    try:
+        lock = getattr(parent_agent, '_active_children_lock', None)
+        if lock:
+            with lock:
+                parent_agent._active_children.remove(child)
+        else:
+            parent_agent._active_children.remove(child)
+    except (ValueError, UnboundLocalError) as e:
+        logger.debug("Could not remove child from active_children: %s", e)
 ```
 
-**作用**：防止无限递归委托
-
----
-
-## 四、使用模式
-
-### 4.1 并行研究
+### 8.4 资源清理
 
 ```python
-delegate_task(tasks=[
-    {
-        "goal": "Research WebAssembly outside the browser in 2025",
-        "context": "Focus on: runtimes (Wasmtime, Wasmer), cloud/edge use cases, WASI progress",
-        "toolsets": ["web"]
-    },
-    {
-        "goal": "Research RISC-V server chip adoption",
-        "context": "Focus on: server chips shipping, cloud providers adopting, software ecosystem",
-        "toolsets": ["web"]
-    },
-    {
-        "goal": "Research practical quantum computing applications",
-        "context": "Focus on: error correction breakthroughs, real-world use cases, key companies",
-        "toolsets": ["web"]
-    }
-])
+# 关闭子 Agent 资源
+try:
+    if hasattr(child, 'close'):
+        child.close()
+except Exception:
+    logger.debug("Failed to close child agent after delegation")
 ```
 
-**优势**：
-- 3 个子 Agent 同时搜索，比串行快 3 倍
-- 每个子 Agent 专注于一个主题，不会混淆
-- 结果按任务索引排序，便于父 Agent 整合
+## 9. 与 Memory 系统的集成
 
-### 4.2 代码审查 + 修复
+### 9.1 子 Agent 跳过 Memory
 
 ```python
-delegate_task(
-    goal="Review the authentication module for security issues and fix any found",
-    context="""Project at /home/user/webapp.
-    Auth module files: src/auth/login.py, src/auth/jwt.py, src/auth/middleware.py.
-    The project uses Flask, PyJWT, and bcrypt.
-    Focus on: SQL injection, JWT validation, password handling, session management.
-    Fix any issues found and run the test suite (pytest tests/auth/).""",
-    toolsets=["terminal", "file"]
+child = AIAgent(
+    # ...
+    skip_memory=True,  # 子 Agent 不加载 Memory 系统
+    # ...
 )
 ```
 
-**优势**：
-- 子 Agent 有全新的上下文，不会被之前的讨论影响
-- 可以深入分析代码，发现潜在问题
-- 自动运行测试验证修复
-
-### 4.3 多文件重构
+### 9.2 委托结果通知 Memory Provider
 
 ```python
-delegate_task(tasks=[
-    {
-        "goal": "Refactor all API endpoint handlers to use the new response format",
-        "context": """Project at /home/user/api-server.
-        Files: src/handlers/users.py, src/handlers/auth.py, src/handlers/billing.py
-        Old format: return {"data": result, "status": "ok"}
-        New format: return APIResponse(data=result, status=200).to_dict()
-        Run tests after: pytest tests/handlers/ -v""",
-        "toolsets": ["terminal", "file"]
-    },
-    {
-        "goal": "Update all client SDK methods to handle the new response format",
-        "context": """Project at /home/user/api-server.
-        Files: sdk/python/client.py, sdk/python/models.py
-        Old parsing: result = response.json()["data"]
-        New parsing: result = response.json()["data"] (same key, but add status code checking)""",
-        "toolsets": ["terminal", "file"]
-    },
-    {
-        "goal": "Update API documentation to reflect the new response format",
-        "context": """Project at /home/user/api-server.
-        Docs at: docs/api/. Update all response examples from old format to new format.""",
-        "toolsets": ["terminal", "file"]
-    }
-])
-```
-
-**优势**：
-- 3 个子 Agent 同时处理不同的文件，互不干扰
-- 每个子 Agent 有自己的终端会话，不会冲突
-- 父 Agent 只接收摘要，上下文保持干净
-
-### 4.4 Subagent-Driven Development（子 Agent 驱动开发）
-
-这是 Hermes Agent 的高级模式，每个任务使用 3 个子 Agent：
-
-1. **Implementer**：实现任务
-2. **Spec Reviewer**：验证是否符合规范
-3. **Quality Reviewer**：审查代码质量
-
-```python
-# Step 1: Implementer
-delegate_task(
-    goal="Implement Task 1: Create User model with email and password_hash fields",
-    context="""
-    TASK FROM PLAN:
-    - Create: src/models/user.py
-    - Add User class with email (str) and password_hash (str) fields
-    - Use bcrypt for password hashing
-    - Include __repr__ for debugging
-    
-    FOLLOW TDD:
-    1. Write failing test in tests/models/test_user.py
-    2. Run: pytest tests/models/test_user.py -v (verify FAIL)
-    3. Write minimal implementation
-    4. Run: pytest tests/models/test_user.py -v (verify PASS)
-    5. Run: pytest tests/ -q (verify no regressions)
-    6. Commit: git add -A && git commit -m "feat: add User model"
-    """,
-    toolsets=['terminal', 'file']
-)
-
-# Step 2: Spec Reviewer
-delegate_task(
-    goal="Review if implementation matches the spec from the plan",
-    context="""
-    ORIGINAL TASK SPEC:
-    - Create src/models/user.py with User class
-    - Fields: email (str), password_hash (str)
-    - Use bcrypt for password hashing
-    - Include __repr__
-    
-    CHECK:
-    - [ ] All requirements from spec implemented?
-    - [ ] File paths match spec?
-    - [ ] Function signatures match spec?
-    
-    OUTPUT: PASS or list of specific spec gaps to fix.
-    """,
-    toolsets=['file']
-)
-
-# Step 3: Quality Reviewer
-delegate_task(
-    goal="Review code quality for Task 1 implementation",
-    context="""
-    FILES TO REVIEW:
-    - src/models/user.py
-    - tests/models/test_user.py
-    
-    CHECK:
-    - [ ] Follows project conventions and style?
-    - [ ] Proper error handling?
-    - [ ] Clear variable/function names?
-    - [ ] Adequate test coverage?
-    
-    OUTPUT FORMAT:
-    - Critical Issues: [must fix before proceeding]
-    - Important Issues: [should fix]
-    - Minor Issues: [optional]
-    - Verdict: APPROVED or REQUEST_CHANGES
-    """,
-    toolsets=['file']
-)
-```
-
-**优势**：
-- 每个子 Agent 专注于单一职责
-- 自动化审查流程，减少人为疏漏
-- 发现问题 early，避免 compounded problems
-
----
-
-## 五、配置选项
-
-### 5.1 全局配置
-
-```yaml
-# ~/.hermes/config.yaml
-
-delegation:
-  max_iterations: 50                        # Max turns per child (default: 50)
-  max_concurrent_children: 3                # Max concurrent subagents (default: 3)
-  default_toolsets: ["terminal", "file", "web"]  # Default toolsets
-  model: "google/gemini-flash-2.0"          # Optional: cheaper model for subagents
-  provider: "openrouter"                    # Optional: route subagents to different provider
-  reasoning_effort: "low"                   # Optional: reduce reasoning for simple tasks
-```
-
-### 5.2 环境变量
-
-```bash
-# ~/.hermes/.env
-DELEGATION_MAX_CONCURRENT_CHILDREN=5
-```
-
-### 5.3 代码配置
-
-```python
-# Single task
-delegate_task(
-    goal="Quick file check",
-    context="Check if /etc/nginx/nginx.conf exists",
-    max_iterations=10,  # Override default
-    toolsets=["terminal", "file"]
-)
-
-# Batch mode
-delegate_task(tasks=[
-    {"goal": "Task A", "toolsets": ["web"], "max_iterations": 20},
-    {"goal": "Task B", "toolsets": ["file"], "max_iterations": 30},
-])
-```
-
----
-
-## 六、与 execute_code 的对比
-
-| 特性 | delegate_task | execute_code |
-|------|--------------|-------------|
-| **推理** | 完整的 LLM 推理循环 | 仅 Python 代码执行 |
-| **上下文** | 完全隔离的对话 | 无对话，仅脚本 |
-| **工具访问** | 所有非阻止工具 + 推理 | 7 个工具 via RPC，无推理 |
-| **并行** | 最多 3 个并发子 Agent | 单个脚本 |
-| **适用场景** | 需要判断的复杂任务 | 机械的多步骤工作流 |
-| **Token 成本** | 更高（完整的 LLM 循环） | 更低（仅 stdout 返回） |
-| **用户交互** | 无（子 Agent 不能 clarify） | 无 |
-
-**使用建议**：
-
-- **使用 delegate_task**：当子任务需要推理、判断或多步骤问题解决
-- **使用 execute_code**：当需要机械的数据处理或脚本化工作流
-
-**混合模式**（最高效）：
-```python
-# Step 1: Mechanical gathering (execute_code is better)
-execute_code("""
-from hermes_tools import web_search, web_extract
-
-results = []
-for query in ["AI funding Q1 2026", "AI startup acquisitions 2026"]:
-    r = web_search(query, limit=5)
-    for item in r["data"]["web"]:
-        results.append({"title": item["title"], "url": item["url"]})
-
-urls = [r["url"] for r in results[:5]]
-content = web_extract(urls)
-
-import json
-with open("/tmp/ai-funding-data.json", "w") as f:
-    json.dump({"search_results": results, "extracted": content["results"]}, f)
-""")
-
-# Step 2: Reasoning-heavy analysis (delegation is better)
-delegate_task(
-    goal="Analyze AI funding data and write a market report",
-    context="Raw data at /tmp/ai-funding-data.json...",
-    toolsets=["terminal", "file"]
-)
-```
-
----
-
-## 七、最佳实践
-
-### 7.1 提供完整的上下文
-
-```python
-# BAD - 子 Agent 无法工作
-delegate_task(goal="Fix the bug")
-
-# GOOD - 子 Agent 有完整的上下文
-delegate_task(
-    goal="Fix the TypeError in api/handlers.py line 47",
-    context="""The error is: 'NoneType' object has no attribute 'get'.
-    The function process_request() receives a dict from parse_body(),
-    but parse_body() returns None when Content-Type is missing.
-    Project is at /home/user/myproject. Run tests with: pytest tests/ -v"""
-)
-```
-
-### 7.2 使用具体的目标
-
-```python
-# BAD - 太模糊
-delegate_task(goal="Improve the code")
-
-# GOOD - 具体明确
-delegate_task(
-    goal="Refactor all print() calls in src/ to use logging module",
-    context="Use logger = logging.getLogger(__name__). Replace print() with:"
-            "- logger.error() for errors"
-            "- logger.warning() for warnings"
-            "- logger.info() for info"
-            "- logger.debug() for debug"
-)
-```
-
-### 7.3 限制工具集
-
-```python
-# BAD - 子 Agent 可能执行意外的命令
-delegate_task(
-    goal="Research WebAssembly",
-    context="...",
-    toolsets=["terminal", "file", "web", "browser"]  # browser is dangerous
-)
-
-# GOOD - 只给必要的工具
-delegate_task(
-    goal="Research WebAssembly",
-    context="...",
-    toolsets=["web"]  # Only web_search and web_extract
-)
-```
-
-### 7.4 合理设置 max_iterations
-
-```python
-# Simple task
-delegate_task(
-    goal="Check if file exists",
-    context="Check if /etc/nginx/nginx.conf exists",
-    max_iterations=5  # Simple task, don't need many turns
-)
-
-# Complex task
-delegate_task(
-    goal="Implement user authentication system",
-    context="...",
-    max_iterations=50  # Complex task, may need many iterations
-)
-```
-
----
-
-## 八、性能优化
-
-### 8.1 减少子 Agent 的迭代次数
-
-```python
-# Simple task
-delegate_task(
-    goal="Quick file check",
-    context="...",
-    max_iterations=10  # Instead of default 50
-)
-```
-
-**节省**：10 iterations × $0.001/iteration = $0.01 saved per subagent
-
-### 8.2 使用更便宜的模型
-
-```yaml
-delegation:
-  model: "google/gemini-flash-2.0"  # Cheaper than gpt-4o
-  provider: "openrouter"
-```
-
-**节省**：gemini-flash 价格是 gpt-4o 的 1/10
-
-### 8.3 限制并发数
-
-```yaml
-delegation:
-  max_concurrent_children: 2  # Instead of default 3
-```
-
-**适用场景**：
-- API key 速率限制较低
-- 预算有限
-- 任务不紧急
-
----
-
-## 九、安全机制
-
-### 9.1 工具阻止
-
-```python
-DELEGATE_BLOCKED_TOOLS = frozenset([
-    "delegate_task",   # 防止递归
-    "clarify",         # 不能与用户交互
-    "memory",          # 不能写入共享记忆
-    "send_message",    # 不能发送跨平台消息
-    "execute_code",    # 应该逐步推理
-])
-```
-
-### 9.2 深度限制
-
-```python
-MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
-```
-
-### 9.3 凭证池隔离
-
-```python
-# 每个子 Agent 从父 Agent 的凭证池中租用一个 key
-leased_cred_id = child_pool.acquire_lease()
-if leased_cred_id is not None:
-    child._swap_credential(leased_entry)
-```
-
-**作用**：防止多个子 Agent 同时使用同一个 API key，导致速率限制
-
----
-
-## 十、与 pi-coding-agent 的集成方案
-
-### 10.1 核心组件实现
-
-#### 1. 子 Agent 构建器
-
-```python
-# pi-coding-agent/agent/subagent_builder.py
-
-from typing import List, Dict, Optional
-from pi_agent_sdk.agent import Agent as PI-Agent
-
-class SubagentBuilder:
-    """构建隔离的子 Agent"""
-    
-    def __init__(self, parent_agent: PI-Agent):
-        self.parent_agent = parent_agent
-        self.max_depth = 2
-        self.blocked_tools = {
-            "delegate_task", "clarify", "memory", "send_message", "execute_code"
-        }
-    
-    def build_child_agent(
-        self,
-        task_index: int,
-        goal: str,
-        context: Optional[str],
-        toolsets: Optional[List[str]],
-        max_iterations: int = 50,
-    ) -> PI-Agent:
-        """构建子 Agent"""
-        
-        # 1. 工具集过滤
-        child_toolsets = self._filter_toolsets(toolsets)
-        
-        # 2. 构建系统提示
-        child_prompt = self._build_system_prompt(goal, context)
-        
-        # 3. 构建子 Agent
-        child = PI-Agent(
-            model=self.parent_agent.model,
-            system_prompt=child_prompt,
-            max_iterations=max_iterations,
-            enabled_tools=child_toolsets,
-            quiet_mode=True,  # 不输出到用户界面
-            session_id=self._generate_unique_session_id(),
-        )
-        
-        # 4. 设置深度
-        child._delegate_depth = getattr(self.parent_agent, '_delegate_depth', 0) + 1
-        
-        return child
-    
-    def _filter_toolsets(self, toolsets: Optional[List[str]]) -> List[str]:
-        """过滤被阻止的工具"""
-        if toolsets is None:
-            return self.parent_agent.enabled_tools
-        
-        return [
-            tool for tool in toolsets
-            if tool not in self.blocked_tools
-        ]
-    
-    def _build_system_prompt(self, goal: str, context: Optional[str]) -> str:
-        """构建子 Agent 的系统提示"""
-        parts = [
-            "You are a focused subagent working on a specific delegated task.",
-            "",
-            f"YOUR TASK:\n{goal}",
-        ]
-        if context and context.strip():
-            parts.append(f"\nCONTEXT:\n{context}")
-        
-        parts.append(
-            "\nComplete this task using the tools available to you. "
-            "When finished, provide a clear, concise summary of:\n"
-            "- What you did\n"
-            "- What you found or accomplished\n"
-            "- Any files you created or modified\n"
-            "- Any issues encountered"
-        )
-        
-        return "\n".join(parts)
-```
-
-#### 2. 并行执行器
-
-```python
-# pi-coding-agent/agent/subagent_executor.py
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Any
-import threading
-
-class SubagentExecutor:
-    """执行子 Agent（并行或串行）"""
-    
-    def __init__(self, max_concurrent: int = 3):
-        self.max_concurrent = max_concurrent
-        self._active_children: List[PI-Agent] = []
-        self._active_children_lock = threading.Lock()
-    
-    def execute_single(self, child: PI-Agent, goal: str) -> Dict[str, Any]:
-        """执行单个子 Agent"""
-        result = child.run(goal)
-        
-        return {
-            "success": True,
-            "result": result,
-            "api_calls": child.api_call_count,
-            "completed": child.is_completed,
-        }
-    
-    def execute_batch(self, tasks: List[Dict], parent_agent: PI-Agent) -> List[Dict]:
-        """批量执行子 Agent（并行）"""
-        results = []
-        
-        with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
-            futures = []
-            
-            for task_index, task in enumerate(tasks):
-                # 构建子 Agent
-                builder = SubagentBuilder(parent_agent)
-                child = builder.build_child_agent(
-                    task_index=task_index,
-                    goal=task["goal"],
-                    context=task.get("context"),
-                    toolsets=task.get("toolsets"),
-                    max_iterations=task.get("max_iterations", 50),
-                )
-                
-                # 提交任务
-                future = executor.submit(
-                    self.execute_single,
-                    child,
-                    task["goal"]
-                )
-                futures.append((task_index, future))
-            
-            # 收集结果
-            for task_index, future in futures:
-                try:
-                    result = future.result()
-                    result["task_index"] = task_index
-                    results.append(result)
-                except Exception as e:
-                    results.append({
-                        "task_index": task_index,
-                        "success": False,
-                        "error": str(e),
-                    })
-        
-        # 按任务索引排序
-        results.sort(key=lambda x: x["task_index"])
-        
-        return results
-```
-
-#### 3. 中断传播
-
-```python
-# pi-coding-agent/agent/interrupt_propagation.py
-
-import threading
-from typing import List
-
-class InterruptPropagation:
-    """中断传播机制"""
-    
-    def __init__(self, parent_agent: PI-Agent):
-        self.parent_agent = parent_agent
-        self._active_children: List[PI-Agent] = []
-        self._active_children_lock = threading.Lock()
-    
-    def add_child(self, child: PI-Agent) -> None:
-        """添加子 Agent"""
-        with self._active_children_lock:
-            self._active_children.append(child)
-    
-    def propagate_interrupt(self, message: Optional[str] = None) -> None:
-        """向所有子 Agent 传播中断"""
-        with self._active_children_lock:
-            children_copy = list(self._active_children)
-        
-        for child in children_copy:
-            try:
-                child.interrupt(message)
-            except Exception as e:
-                logger.debug(f"Failed to propagate interrupt to child: {e}")
-    
-    def cleanup(self) -> None:
-        """清理子 Agent"""
-        with self._active_children_lock:
-            children = list(self._active_children)
-            self._active_children.clear()
-        
-        for child in children:
-            try:
-                child.close()
-            except Exception as e:
-                logger.debug(f"Failed to close child: {e}")
-```
-
-### 10.2 集成到 pi-coding-agent
-
-```python
-# pi-coding-agent/tools/delegate_tool.py
-
-from typing import List, Dict, Optional
-from pi_agent_sdk.tool import Tool, ToolRegistry
-from .subagent_builder import SubagentBuilder
-from .subagent_executor import SubagentExecutor
-from .interrupt_propagation import InterruptPropagation
-
-registry = ToolRegistry()
-
-def delegate_task(
-    goal: Optional[str] = None,
-    context: Optional[str] = None,
-    toolsets: Optional[List[str]] = None,
-    max_iterations: int = 50,
-    tasks: Optional[List[Dict]] = None,
-) -> Dict[str, Any]:
-    """
-    Delegate task to subagent(s)
-    
-    Args:
-        goal: Single task goal
-        context: Task context
-        toolsets: Toolsets to enable for subagent
-        max_iterations: Max iterations for subagent
-        tasks: Batch tasks (parallel execution)
-    
-    Returns:
-        Summary of the delegation
-    """
-    agent = get_current_agent()  # 获取当前 pi-coding-agent 实例
-    
-    # 检查深度限制
-    current_depth = getattr(agent, '_delegate_depth', 0)
-    if current_depth >= 2:
-        return {
-            "success": False,
-            "error": "Delegation depth limit exceeded (max 2)"
-        }
-    
-    # 创建中断传播器
-    interruptor = InterruptPropagation(agent)
-    
-    # 选择执行模式
-    if tasks is not None:
-        # Batch mode (parallel)
-        executor = SubagentExecutor(max_concurrent=3)
-        results = executor.execute_batch(tasks, agent)
-        
-        # 汇总结果
-        summaries = []
-        for result in results:
-            if result["success"]:
-                summaries.append(result["result"])
-            else:
-                summaries.append(f"Failed: {result.get('error', 'Unknown error')}")
-        
-        return {
-            "success": True,
-            "results": summaries,
-            "task_count": len(tasks),
-        }
-    else:
-        # Single task mode
-        if goal is None:
-            return {
-                "success": False,
-                "error": "goal is required for single task delegation"
-            }
-        
-        builder = SubagentBuilder(agent)
-        child = builder.build_child_agent(
-            task_index=0,
-            goal=goal,
-            context=context,
-            toolsets=toolsets,
-            max_iterations=max_iterations,
-        )
-        
-        interruptor.add_child(child)
-        
+# 在 delegate_task 返回前
+if parent_agent and hasattr(parent_agent, '_memory_manager') and parent_agent._memory_manager:
+    for entry in results:
         try:
-            result = executor.execute_single(child, goal)
-            
-            return {
-                "success": result["success"],
-                "result": result["result"],
-                "api_calls": result["api_calls"],
-            }
-        finally:
-            interruptor.cleanup()
-
-
-# 注册工具
-registry.register(
-    Tool(
-        name="delegate_task",
-        description="Spawn isolated child agents for parallel workstreams",
-        parameters={
-            "type": "object",
-            "properties": {
-                "goal": {"type": "string", "description": "Single task goal"},
-                "context": {"type": "string", "description": "Task context"},
-                "toolsets": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Toolsets to enable"
-                },
-                "max_iterations": {
-                    "type": "integer",
-                    "default": 50,
-                    "description": "Max iterations for subagent"
-                },
-                "tasks": {
-                    "type": "array",
-                    "items": {"type": "object"},
-                    "description": "Batch tasks for parallel execution"
-                },
-            },
-            "required": ["goal", "tasks"],  # 至少提供一个
-        },
-        func=delegate_task
-    )
-)
+            _task_goal = task_list[entry["task_index"]]["goal"]
+            parent_agent._memory_manager.on_delegation(
+                task=_task_goal,
+                result=entry.get("summary", "") or "",
+                child_session_id=getattr(children[entry["task_index"]][2], "session_id", ""),
+            )
+        except Exception:
+            pass
 ```
 
-### 10.3 配置文件
+### 9.3 Memory Provider 的 on_delegation 钩子
+
+```python
+# 在 memory_provider.py 中
+def on_delegation(self, task: str, result: str, *,
+                  child_session_id: str = "", **kwargs) -> None:
+    """Called on the PARENT agent when a subagent completes.
+
+    The parent's memory provider gets the task+result pair as an
+    observation of what was delegated and what came back. The subagent
+    itself has no provider session (skip_memory=True).
+
+    task: the delegation prompt
+    result: the subagent's final response
+    child_session_id: the subagent's session_id
+    """
+```
+
+## 10. 凭证管理
+
+### 10.1 凭证解析
+
+```python
+def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+    # 1. 如果配置了 base_url → 使用直接端点
+    if configured_base_url:
+        return {
+            "model": configured_model,
+            "provider": provider,
+            "base_url": configured_base_url,
+            "api_key": api_key,
+            "api_mode": api_mode,
+        }
+    
+    # 2. 如果配置了 provider → 通过运行时解析
+    if configured_provider:
+        runtime = resolve_runtime_provider(requested=configured_provider)
+        return {
+            "model": configured_model,
+            "provider": runtime.get("provider"),
+            "base_url": runtime.get("base_url"),
+            "api_key": api_key,
+            "api_mode": runtime.get("api_mode"),
+        }
+    
+    # 3. 未配置 → 子 Agent 继承父 Agent 凭证
+    return {
+        "model": None,
+        "provider": None,
+        "base_url": None,
+        "api_key": None,
+        "api_mode": None,
+    }
+```
+
+### 10.2 凭证池租赁
+
+```python
+def _resolve_child_credential_pool(effective_provider, parent_agent):
+    # 1. 相同 provider → 共享父 Agent 的凭证池
+    if effective_provider == parent_provider:
+        return parent_pool
+    
+    # 2. 不同 provider → 加载该 provider 的凭证池
+    pool = load_pool(effective_provider)
+    if pool is not None and pool.has_credentials():
+        return pool
+    
+    # 3. 无可用池 → 返回 None，子 Agent 使用继承凭证
+    return None
+```
+
+### 10.3 租赁生命周期
+
+```python
+# 子 Agent 运行时
+leased_cred_id = None
+if child_pool is not None:
+    leased_cred_id = child_pool.acquire_lease()
+    if leased_cred_id is not None:
+        leased_entry = child_pool.current()
+        child._swap_credential(leased_entry)
+
+# finally 块中
+if child_pool is not None and leased_cred_id is not None:
+    child_pool.release_lease(leased_cred_id)
+```
+
+## 11. 配置系统
+
+### 11.1 配置加载
+
+```python
+def _load_config() -> dict:
+    # 1. 运行时配置 (cli.py CLI_CONFIG)
+    try:
+        from cli import CLI_CONFIG
+        cfg = CLI_CONFIG.get("delegation", {})
+        if cfg:
+            return cfg
+    except Exception:
+        pass
+    
+    # 2. 持久化配置 (hermes_cli/config.py)
+    try:
+        from hermes_cli.config import load_config
+        full = load_config()
+        return full.get("delegation", {})
+    except Exception:
+        return {}
+```
+
+### 11.2 配置选项
 
 ```yaml
-# pi-coding-agent-config.yaml
-
+# In ~/.hermes/config.yaml
 delegation:
-  max_iterations: 50
-  max_concurrent_children: 3
-  default_toolsets:
-    - terminal
-    - file
-    - web
-  model: null  # 使用父 Agent 的模型
-  provider: null  # 使用父 Agent 的 provider
+  max_iterations: 50                        # 每个子 Agent 最大迭代次数
+  max_concurrent_children: 3                # 最大并发子 Agent 数
+  default_toolsets: ["terminal", "file", "web"]  # 默认工具集
+  model: "google/gemini-3-flash-preview"    # 子 Agent 使用的模型
+  provider: "openrouter"                    # 子 Agent 的 provider
+  reasoning_effort: "low"                   # 推理努力程度
+  base_url: "http://localhost:1234/v1"      # 直接端点（替代 provider）
+  api_key: "local-key"                      # 端点 API key
 ```
 
----
+## 12. 工具集选择策略
 
-## 十一、总结
+| 任务类型 | 工具集 | 说明 |
+|----------|--------|------|
+| Web 研究 | `["web"]` | 仅 web_search + web_extract |
+| 代码工作 | `["terminal", "file"]` | Shell 访问 + 文件操作 |
+| 全栈任务 | `["terminal", "file", "web"]` | 除消息外的所有工具 |
+| 只读分析 | `["file"]` | 只能读取文件，无 Shell |
 
-### 11.1 核心创新
+## 13. 设计亮点总结
 
-1. **隔离的上下文**：子 Agent 从零开始，没有父 Agent 的对话历史
-2. **并行执行**：最多 3 个子 Agent 同时运行
-3. **受限的工具集**：自动过滤危险工具
-4. **凭证池共享**：子 Agent 继承父 Agent 的 API 凭证池
-5. **中断传播**：父 Agent 中断会自动中断所有子 Agent
-6. **深度限制**：防止无限递归委托
+### 13.1 会话隔离
 
-### 11.2 设计哲学
+- **零知识启动**：子 Agent 对父对话完全无知
+- **独立终端会话**：每个子 Agent 有自己的工作目录和状态
+- **受限工具集**：防止子 Agent 产生副作用
 
-- **专注**：每个子 Agent 只负责一个任务
-- **隔离**：子 Agent 与父 Agent 完全隔离
-- **并行**：多个子 Agent 可以同时工作
-- **安全**：阻止危险工具，限制深度
-- **容错**：凭证池共享，速率限制恢复
+### 13.2 并行执行
 
-### 11.3 与 pi-coding-agent 的集成要点
+- **线程池模式**：支持最多 3 个并发子 Agent
+- **进度显示**：CLI 树视图 + Gateway 批量进度
+- **心跳机制**：防止网关超时
 
-1. **子 Agent 构建器**：实现工具集过滤和系统提示构建
-2. **并行执行器**：使用 ThreadPoolExecutor 实现并行执行
-3. **中断传播器**：实现父 Agent 中断传播到子 Agent
-4. **配置管理**：支持 YAML 配置和环境变量
-5. **进度回调**：实现子 Agent 的进度显示
+### 13.3 中断传播
 
----
+- **注册/注销机制**：子 Agent 生命周期管理
+- **锁保护**：线程安全的子 Agent 列表操作
+- **资源清理**：finally 块确保资源释放
 
-## 十二、参考资料
+### 13.4 凭证管理
 
-### 官方文档
-- [Subagent Delegation](https://hermes-agent.nousresearch.com/docs/user-guide/features/delegation.md)
-- [Delegation & Parallel Work](https://hermes-agent.nousresearch.com/docs/guides/delegation-patterns.md)
-- [Credential Pools](https://hermes-agent.nousresearch.com/docs/user-guide/features/credential-pools.md)
+- **继承机制**：子 Agent 默认继承父凭证
+- **凭证池共享**：支持凭证轮换
+- **租赁机制**：防止凭证冲突
 
-### 源码
-- [delegate_tool.py](file:///Users/saga/code-repos/PI-Coding-Agent-OpenClaw-study/hermes-agent-source-code/tools/delegate_tool.py)
-- [run_agent.py](file:///Users/saga/code-repos/PI-Coding-Agent-OpenClaw-study/hermes-agent-source-code/run_agent.py)
-- [credential_pool.py](file:///Users/saga/code-repos/PI-Coding-Agent-OpenClaw-study/hermes-agent-source-code/agent/credential_pool.py)
+### 13.5 Memory 集成
 
-### 技能
-- [Subagent-Driven Development](file:///Users/saga/code-repos/PI-Coding-Agent-OpenClaw-study/hermes-agent-source-code/skills/software-development/subagent-driven-development/SKILL.md)
+- **子 Agent 跳过**：避免污染共享记忆
+- **委托结果通知**：父 Agent 的 Memory Provider 记录委托结果
+- **on_delegation 钩子**：支持跨会话记忆
 
----
+## 14. 对 pi-coding-agent 的借鉴建议
 
-**文档完成日期**: 2026-04-16  
-**作者**: AI Assistant
+### 14.1 架构层面
+
+1. **实现 delegate_task 工具**：支持单任务和批量并行模式
+2. **子 Agent 会话隔离**：独立上下文、工具集、终端
+3. **深度限制**：防止递归委托（MAX_DEPTH=2）
+4. **中断传播**：父 Agent 中断时传播到所有子 Agent
+
+### 14.2 工具集管理
+
+1. **被禁止工具列表**：防止子 Agent 产生副作用
+2. **工具集继承**：子 Agent 工具集 ⊆ 父 Agent 工具集
+3. **工具集选择策略**：根据任务类型推荐工具集
+
+### 14.3 并行执行
+
+1. **线程池执行**：支持并发子 Agent
+2. **进度显示**：CLI 和 Gateway 模式适配
+3. **心跳机制**：防止超时
+
+### 14.4 凭证管理
+
+1. **凭证继承**：子 Agent 默认继承父凭证
+2. **凭证池共享**：支持凭证轮换
+3. **租赁机制**：防止凭证冲突
+
+### 14.5 Memory 集成
+
+1. **子 Agent 跳过 Memory**：避免污染共享记忆
+2. **委托结果通知**：父 Agent 记录委托结果
+3. **on_delegation 钩子**：支持跨会话记忆
+
+## 15. 实现路线图
+
+### 阶段 1：基础委托工具
+
+1. 实现 delegate_task 工具签名
+2. 实现 _build_child_agent 函数
+3. 实现 _run_single_child 函数
+4. 实现单任务模式
+
+### 阶段 2：并行执行
+
+1. 实现 ThreadPoolExecutor 并行执行
+2. 实现进度显示（CLI + Gateway）
+3. 实现心跳机制
+4. 实现结果排序和聚合
+
+### 阶段 3：中断传播
+
+1. 实现 _active_children 列表
+2. 实现 interrupt 传播
+3. 实现子 Agent 注册/注销
+4. 实现资源清理
+
+### 阶段 4：凭证管理
+
+1. 实现凭证继承
+2. 实现凭证池共享
+3. 实现租赁机制
+4. 实现凭证解析
+
+### 阶段 5：Memory 集成
+
+1. 实现 skip_memory 参数
+2. 实现 on_delegation 钩子
+3. 实现委托结果通知
+4. 实现跨会话记忆
+
+### 阶段 6：配置系统
+
+1. 实现配置加载
+2. 实现配置选项
+3. 实现工具集选择策略
+4. 实现深度限制
+
+## 16. 总结
+
+Hermes Agent 的 Multi-Agent 委托与协调系统是一个功能完整、设计精良的子 Agent 管理系统，核心设计原则包括：
+
+- **会话隔离**：子 Agent 零知识启动，独立上下文和工具集
+- **并行执行**：线程池模式，支持最多 3 个并发子 Agent
+- **中断传播**：父 Agent 中断时传播到所有子 Agent
+- **凭证管理**：继承机制 + 凭证池共享 + 租赁机制
+- **Memory 集成**：子 Agent 跳过 Memory，委托结果通知父 Agent
+- **深度限制**：防止递归委托（MAX_DEPTH=2）
+
+该系统已成功支持多种委托模式，包括并行研究、代码审查、多文件重构、收集+分析等，是构建复杂 Agent 系统的核心基础设施。
