@@ -1,11 +1,9 @@
 # pi.dev（pi2）代码架构与 Agent Harness 研究报告
 
 > 研究对象：`pi2-source-code/pi`（pi.dev 官方 monorepo，`@earendil-works/*`）
-> 版本：`0.85.1` ｜ **本工作区快照 HEAD**：`71dca871b`（2026-09-11，"fix(ci): Fix a broken test"）
+> 版本：`0.85.1` ｜ HEAD：`3349e1db`（2026-09-16，"fix(coding-agent): reject unverified local clipboard writes"）｜ `git describe`：`v0.85.1-75-g3349e1db1`
 > 代码规模：11 个 package、约 1.2 万文件（含 node_modules 外的 src/test/docs）
 > 对比基线：`pi-coding-agent-source-code/pi-mono`（pi1，`0.67.68`，2026-04-18）
->
-> ⚠️ **关于上游最新版本**：有审阅意见指出上游 main 已推进到 `3349e1db`（2026-09-15）。**本机当时无网络，未能独立核实这个哈希**。本文所有源码引用、行号、行为结论**一律以本工作区快照 `71dca871b` 为准**；若上游已变更，请以 `git log` 实际结果校准，不要把上面的上游哈希当作已验证事实。
 
 ---
 
@@ -153,7 +151,8 @@ DeepSeek → Cordis / Everything is Plugin
 | **收敛** | 不同的说法/机制最后指向同一个问题或同一个结论 |
 | **契约** | 双方约定的"长什么样、能做什么"。在本报告里通常指**类型层面的约定**，由编译器而不是由人来检查 |
 | **状态机** | 一个对象只能处在有限几个状态之一，并且只能按规定的路径从一个状态走到另一个 |
-| **投影 / 整理** | 从一份完整的原始数据里，挑出这次需要的那部分并重新组织。本报告尽量用"整理上下文"这个说法 |
+| **投影（projection）** | 从一份完整的原始数据里，挑出这次需要的那部分并重新组织。本报告在讲 §4.1 的**第 ① 步**时固定用"投影" |
+| **提升（lift）** | A/B 实验里的常规说法：**实验组 − 对照组**。本报告里特指 §5.8 的"文档提升"——同一个 case，能读文档 vs 读不到文档，两边通过率之差（单位 pp，百分点） |
 
 后面出现这些词时，会尽量在第一次用到的地方再用大白话解释一遍。
 
@@ -244,7 +243,7 @@ pi/
 │   ├── client/                   # 传输无关的协议客户端
 │   ├── server/                   # 实验性本地服务端（Session 路由 + 多 presentation 附件）
 │   ├── coding-agent/             # CLI 产品（4 种运行模式 + 扩展系统）
-│   └── evals/                    # 行为级 eval（vitest-evals，跑真实 AgentSession）
+│   └── evals/                    # 行为级 eval：host 套件 + 文档提升（docs-lift）对比
 ├── scripts/                      # 发布、shrinkwrap、entry-graph、browser-smoke 等校验脚本
 ├── AGENTS.md                     # 项目开发规则（对人和 agent 同时生效）
 └── .pi/skills/                   # 仓库自用的 pi skill（如 interactive-testing.md）
@@ -793,7 +792,7 @@ Resource（Skill / PromptTemplate）
         └── 显式激活 → 进会话历史（重、一次性写入、之后一直跟着）
 ```
 
-这正是"**Agent Runtime 不是'拼一条 prompt'，而是管理不同来源、不同生命周期、不同语义的模型可见信息**"最直接的证据。`before_run` hook 的事件里同时带着 `prompt` 和 `resources` 两个字段（`agent-harness.ts:424`），也从侧面印证了：在这套设计里，**资源与消息是并列的两类输入**。
+这正是"**Agent Runtime 不是'拼一条 prompt'，而是管理不同来源、不同生命周期、不同语义的模型可见信息**"最直接的证据。`before_run` hook 的事件里同时带着 `prompt` 和 `resources` 两个字段（`agent-harness.ts:431-432`），也从侧面印证了：在这套设计里，**资源与消息是并列的两类输入**。
 
 > ⚠️ 一个容易被忽略的细节：方式 A 的产物进的是 **system prompt**，方式 B 的产物进的是 **会话历史**。这意味着**同一份 skill 内容，会因为"怎么进去"而拥有完全不同的持久性和缓存行为**——方式 B 一旦写入，就永远改变了后续每一轮的上下文（并且会破坏 §4.3 那条只追加铁律的"尾部"位置假设，因为它追加在尾部，所以是安全的）。
 
@@ -1121,11 +1120,117 @@ export default function (pi: ExtensionAPI) {
 
 ### 5.8 Evals
 
-`packages/evals` 把真实 `AgentSession` 适配到 `vitest-evals`，在隔离的临时项目/agent 目录中运行，附带原生 session 产物。用途是**度量端到端行为并对比 prompt / 工具 / skill / 模型 / harness 配置**——而不是跑单元测试。
+`packages/evals`（`@earendil-works/pi-evals`）用 `vitest-evals` 做**行为级**评测，而不是单元测试。它现在分成两条明确不同的路径：
+
+| 路径 | 文件约定 | 怎么跑 | 是什么 |
+|---|---|---|---|
+| **Host evals** | `evals/*.eval.ts`（除 `*.docs.eval.ts`） | `eval:host` = `vitest run --config vitest.evals.config.ts --project host` | 普通的 vitest-evals 套件，在**本机**跑，不做成对比较 |
+| **Documentation-lift evals** | `evals/*.docs.eval.ts` | `eval:docs` = `node --experimental-strip-types src/cli.ts` | 成对实验：同一个 case 在 `without_docs` / `with_docs` 两个隔离容器里各跑一遍，比较"文档在不在模型视野里"带来的差异（下节详述） |
+
+`npm run eval` = `eval:host` + `eval:docs` 两段依次跑。
+
+`src/` 是 runner 代码，职责切得很干净：
+
+- `cli.ts` — 编排一次比较；
+- `docker.ts` — 构建两个镜像、发现 case、跑其中一条隔离臂；
+- `plan.ts` — 把 case 展开成 `(case, variant, repetition)` 任务；
+- `report.ts` — 读 Vitest JSON、配对两条臂、算 lift；
+- `harness.ts` — vitest-evals 适配器。
+
+评测套件与 fixture 在 `evals/` 下；镜像构建文件在 `docker/` 下。
 
 ```bash
-npm run eval -- src/extensions.eval.ts src/models.eval.ts --provider openai --model gpt-5.6-sol --repetitions 5
+# host evals + 文档比较（需要 PI_PROVIDER / PI_MODEL）
+PI_PROVIDER=openai-codex PI_MODEL=gpt-5.6-sol npm run eval -w packages/evals
+
+# 只跑 host evals；或只跑某一个套件
+npm run eval:host -w packages/evals
+npm run eval:host -w packages/evals -- evals/documentation-audit.eval.ts
 ```
+
+默认每个 variant 跑一次；要衡量稳定性需显式提高重复次数（`--runs-per-variant 5` 或 `PI_EVAL_RUNS_PER_VARIANT=5`）。Vitest 的 `-t` 过滤器在**发现阶段**就生效。
+
+#### 什么叫"文档带来的提升（docs lift）"
+
+先给一句话定义：
+
+> **同一道题、同一个模型，做两遍。两遍唯一的差别是：一遍能读到这个项目的文档，另一遍读不到。两遍通过率之差，就是"文档带来的提升"。**
+
+"lift" 是 A/B 实验里的常规说法（实验组 − 对照组），不是 pi 自造的词。
+
+**为什么值得专门做这个实验**
+
+pi 的核心主张之一是"模型能看到什么，是程序算出来的"。文档是这份"能看到的东西"里最容易被忽略的一块。于是有一个可以直接量出来的问题：
+
+- 把文档从模型视野里**拿掉**，它做题会不会变差？差多少？
+- 如果拿掉之后成绩**没变**，那说明文档白写了——模型根本没用上。
+
+**两个变体到底差在哪（这是关键）**
+
+| | `without_docs`（对照组） | `with_docs`（实验组） |
+|---|---|---|
+| 文件 | 删掉 coding-agent 的 `README.md` / `CHANGELOG.md` / `docs/` / `examples/` | 保留 |
+| system prompt | **同时**删掉默认 prompt 里"Pi 文档在哪"那一段（documentation-routing section） | 原样不动 |
+| 其余一切 | 同一份 workspace tarball、同一套 npm overrides、同样的工具白名单、同一个模型、同一道题 | 相同 |
+
+所以严格说，被操纵的自变量是**一整包"文档可见性"**（文件 + 那一小段 system prompt），而不是单独某一样。
+
+工具白名单也值得注意：文档 eval 默认只给 `read` / `write` / `edit` / `grep` / `find` / `ls`，**不给 shell、不给联网搜索**。因为这道题要测的是"文档能不能被读到"，不是"模型能不能用 curl 去 GitHub 上抓文档"。
+
+**"提升"怎么算出来**
+
+```
+lift = with_docs 的通过率 − without_docs 的通过率        （单位：pp，百分点）
+```
+
+（"通过率" = 该组里判分 `score ≥ 1` 的 arm 占该组全部 arm 的比例；`score` 由 vitest-evals 的 judge 给出。源码 `report.ts` 里就是 `lift: difference(treatmentPassRate, controlPassRate)`。）
+
+报告里长这样：
+
+```
+Pass rate  +21.5 pp (with 78.0%, without 56.5%)
+Est. cost  +$0.0312 (with $0.0841, without $0.0529, 12 pairs)
+```
+
+除了通过率，还会算 token 数 / 工具调用次数 / 耗时 / 估算成本的**平均差**（`meanDelta`）——因为"文档让它做对了"和"文档让它多花了一倍钱"是两件事，都要看见。
+
+**为什么必须"成对"**
+
+每个 `(case, variant, model, runNumber)` 是一条 arm，跑在一个全新的容器里（新的 home、agent 目录、workspace、session 目录、容器文件系统；eval 定义与配置在降权到非特权 UID 后不可读；内部依赖包的文档也**对称删除**，防止它们变成"另一份说明书"）。
+
+只有当同一道题的对照组和实验组**各自恰好产出一个分数**时，这一对才算数（eligible pair）。缺一条、重复、skipped / pending / unscored / errored——这一对就被 blocked。
+
+**只要有一对被 blocked，整组的 headline 通过率就不公布**，进程以非零码退出。这是刻意的：宁可不说，也不给一个可能误导的平均数。缺失的 telemetry 同样保持"不可用"，而不是当成 0。
+
+**报告会主动标出"这几种结果没意义"**
+
+| flag | 含义 |
+|---|---|
+| `no-lift` | 两边一样 → 文档没起作用 |
+| `negative-delta` | 给了文档反而更差 |
+| `control-saturated` / `treatment-saturated` | 某一组全对 → 题目太简单，测不出差别 |
+| `flaky` | 同一配置重复跑，结果不稳定 |
+
+而且报告明说：**只跑一次不能用来判断稳定性**——要显式加 `--runs-per-variant N`。
+
+**一个具体例子**
+
+`evals/extensions.docs.eval.ts` 的题目是：
+
+> "给这个正在运行的 Pi 装一个扩展，里面有个 hello 工具，传 Bob 返回 `Hello, Bob!`。"（然后 reload，再让模型用这个工具问候 Bob。）
+
+判分同时看四件事：最终回复内容、扩展加载有没有报错、hello 工具是否真的被注册、工具调用返回了什么。
+
+- `with_docs`：模型可以读 `docs/extensions.md`（3033 行），照着写；
+- `without_docs`：没有这份文档，只能靠猜 API 形状。
+
+两边通过率之差，就是"extensions 文档"这件事的价值。
+
+**和本文主题的关系**
+
+这是仓库里唯一一处把"模型输入变了会怎样"**变成数字**的地方。而且它改的恰好是模型输入里最"文字"的那一块。
+
+不过要说清一个边界：**文档是通过 `read` 工具被读进来的**，走的是工具调用路径，属于 §4.4 表 B 里"模型可见"的那一类；只有"文档路由段"那一小块真正待在 system prompt 字段里。所以它检验的不是"system prompt 写得对不对"，而是"**从构造链上拿掉一整块输入，行为会不会变**"。如果 §4 对这条链的描述是对的，答案就应该是"会变，而且能量出来"。
 
 ---
 
@@ -1692,7 +1797,7 @@ await host.dispose()         // 退役
 
 ### 7.8 Plugin Reload：运行中的组件怎么替换
 
-替换一个正在服务的插件，难点是"替换期间 consumer 会不会看到服务消失"。Chord 的答案是**三段式**（`worker.ts:84-103` 的 `reloadPlugins`，用串行 `reloadTail` 保证不并发）：
+替换一个正在服务的插件，难点是"替换期间 consumer 会不会看到服务消失"。Chord 的答案是**三段式**（`experimental/services/worker.ts:86-106` 的 `reloadPlugins`，用串行 `reloadTail` 保证不并发）：
 
 ```
 candidate = await pluginLoader.load()
@@ -2406,7 +2511,7 @@ core instructions
 ### 9.8 pi 可从 dsh / Cordis 借的三件事（具体）
 
 1. **`dsh config` 式的"最终合成树"可视化**：facet/bundle 叠加之后"实际生效的到底是什么"今天只能靠读代码；dsh 把它做成了一等命令。§6 的 facet 排查成本会大降。
-2. **把"可逆副作用"当作扩展 API 的契约**：pi 的扩展卸载/热替换今天靠人工写对清理逻辑（`worker.ts` 的 `retired.dispose()`）；Cordis 把"注册即附带撤销"做进了框架（所有上下文变更都归结为 `ctx.effect`，而且**每个注册都返回一个 disposer**——dsh 的 `ctx.systemPrompt.section()` 等 API 正是这个形态）。可以直接对标 Chord 的 `own()` 机制补齐——**但要注意 §8.3 的取舍**：Cordis 的统一原语是有代价的（代理模型），照搬会丢掉 Chord 现在的能力边界。
+2. **把"可逆副作用"当作扩展 API 的契约**：pi 的扩展卸载/热替换今天靠人工写对清理逻辑（`experimental/services/worker.ts` 的 `retired.dispose()`）；Cordis 把"注册即附带撤销"做进了框架（所有上下文变更都归结为 `ctx.effect`，而且**每个注册都返回一个 disposer**——dsh 的 `ctx.systemPrompt.section()` 等 API 正是这个形态）。可以直接对标 Chord 的 `own()` 机制补齐——**但要注意 §8.3 的取舍**：Cordis 的统一原语是有代价的（代理模型），照搬会丢掉 Chord 现在的能力边界。
 3. **`PromptContext` 式的"贡献 + 排序 + 快照"三件套**：dsh 把动态上下文做成了**可注册、可排序、可抑制（`suppressRuntimeContext()`）、带缓存安全快照语义**的一等对象。pi 目前的对应物是 `entryProjectors` + `transform_context`，扩展点更窄、也更不显式。若 pi 未来要让插件更规范地贡献运行时上下文，dsh 这个形态是现成参考——**而且它不违反 pi 的只追加铁律**（快照只追加在保留历史之后）。
 
 反过来，dsh 若借鉴 pi，最值得拿的是**§4 的崩溃恢复完备性**（13 个平铺状态 + accept/drive 分离 + replay 契约）与**§4.7 的"事件不驱动"纪律**——这两样在 dsh 的公开文档里找不到等价物。
@@ -2535,10 +2640,11 @@ core instructions
 | `packages/agent/docs/pico-v3.md` | 下一代 harness 设计（2113 行，讨论中） |
 | `packages/agent/docs/pico/pico-usage-guide.md` | pico 使用指南（1497 行） |
 | `packages/agent/docs/work-packages/00–09` | WP 工作包（runtime1 移除 → lane snapshot settled tools） |
-| `packages/coding-agent/docs/` | 34 篇用户/开发者文档（extensions 3033 行、rpc 1618 行、sdk 1226 行…） |
+| `packages/coding-agent/docs/` | 30 篇用户/开发者文档（extensions 3033 行、rpc 1618 行、sdk 1226 行…） |
 | `packages/chord/README.md` | **Chord 设计总览（205 行）：六件套、remote adapter、delta、bundling** |
 | `packages/chord/PLANNING.md` | Chord RPC / generation-loading 规划 |
 | `packages/chord/src/delta/README.md` | delta 变更、数组、生命周期与消费者所有权规则 |
+| `packages/evals/README.md` | **evals 两条路径（host / docs-lift）的文件约定与运行方式；`src/` 五个 runner 模块的职责划分** |
 | `AGENTS.md` / `CONTRIBUTING.md` / `SECURITY.md` | 项目规则 |
 
 **外部对照资料（DeepSeek Harness，§9 用；非本工作区文件）**
@@ -2571,8 +2677,11 @@ core instructions
 | `packages/coding-agent/src/experimental/session-worker.ts` | 884 | 实验性 session worker |
 | `packages/coding-agent/src/experimental/mini/` | — | 最小分布式 harness（server/worker/tui） |
 | `packages/coding-agent/src/experimental/services/worker.ts` | — | **标准组装模板**：builtins + 插件 facets → `createFacetHost` → 候选 reload（§7.9） |
-| `packages/chord/src/types.ts` | — | `Facet` / `FacetEnvironment` / `Service` / `ServiceMode` / wire 类型全集 |
+| `packages/chord/src/types.ts` | 261 | `Facet` / `FacetEnvironment` / `Service` / `ServiceMode` / wire 类型全集 |
 | `packages/chord/src/api.ts` | 90 | `createFacetHost` / `defineFacet` / `defineService` / `replicatedState` / `createRemoteServiceBinding`；`$chord.` 保留前缀检查 |
+| `packages/evals/src/harness.ts` | 498 | vitest-evals 适配器（host 与 docs 两条路径共用） |
+| `packages/evals/src/cli.ts` / `docker.ts` / `plan.ts` / `report.ts` | 192 / 175 / 59 / 481 | 文档提升对比的四段 runner：编排 → 隔离容器 → 任务展开 → lift 计算 |
+| `packages/evals/evals/*.docs.eval.ts` | — | 文档提升 case（custom-provider / documentation-audit / extensions / models / openai-provider） |
 | `packages/chord/src/facets/host.ts` | 906 | FacetKernel：setup/激活/依赖图校验/reload/dispose |
 | `packages/chord/src/services/` | ~1900 | service consumer/provider/handle/state-codec/wire（`$chord.service` 控制通道） |
 | `packages/chord/src/delta/index.ts` | 1267 | 独立 delta 原语（`track`/`apply`，base batch + 路径操作） |
