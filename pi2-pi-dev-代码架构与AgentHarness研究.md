@@ -7,14 +7,35 @@
 
 ---
 
+## 阅读指引：本报告的两条主线
+
+这篇报告不是"逐个包介绍"。它围绕 pi2 内部**两个彼此独立、但必须互相配合的问题**展开：
+
+| 主线 | 问题 | pi2 的答案 | 本文位置 |
+|---|---|---|---|
+| **Execution** | 一个 Agent 怎么在崩溃、重试、并发的现实里**可靠地跑**？ | `AgentHarness` | §4 |
+| **Composition** | 当这个 Agent 不再是"一个进程里的一件事"，而是**多界面、多进程、可插拔、部分能力在远端**时，怎么把它**装起来**？ | `Chord` | §6–§8 |
+
+一句话记住两者的分工：
+
+> **AgentHarness 解决 execution，Chord 解决 composition。**
+
+这两条线的关系不是并列，而是**因果**：先有 execution 的可靠内核，才暴露出 composition 这个更大的问题；而 Chord 就是 pi.dev 对 composition 的回答。所以本报告先铺平 execution，再铺平 composition 的问题空间，然后才展开 Chord——**为了理解 Chord，先把它所在的问题空间铺平**。
+
+最后（§9）再拿这套模型去看 DeepSeek Harness（dsh / Cordis），回答一个更实际的问题：**这两个系统到底是不是在解决同一个问题？**
+
+---
+
 ## 0. 结论速览
 
 1. **pi2 把"可持久化的 Agent 运行时"从应用层下沉到了核心层**。pi1 的 `pi-agent-core` 只有 `Agent` + `agent-loop` 两个文件；pi2 新增 `AgentHarness`，用「不可变 entry 树 + 可变更值/列表 + append-only 用量账本」三存储模型承载完整的崩溃恢复语义。
 2. **整个 harness 的设计被一条不变式统治**：*任何 payload 只存在于 entry、bound value/list、或 ledger 三者之一*。所有并发、恢复、清理、分叉、附件（attachment）规则都从这条不变式推导。
 3. **接受（accept）与执行（drive）分离**。`accept` 只落盘一个 operation，不启动任何进程内工作；`drive` 才安装进程内的 pass。这使 harness 天然适配"无调度器的服务端"（alarm / job / HTTP 重入均可）。
 4. **"意图 → 不确定效果 → 结算"两段提交**包裹所有外部效果（provider 请求、真实工具调用），使崩溃点可枚举、可恢复，且**永不重放已结算的效果**。
-5. **稳定 CLI 与实验性分布式架构并行存在**：稳定版 `pi` CLI 仍跑 `Agent` + JSONL `SessionManager`；`AgentHarness` + Chord facet/RPC + session worker 只在 `src/experimental/` 与 `packages/{protocol,client,server,chord}` 中启用。这是本仓库当前最重要的"双轨"事实。
-6. 代码质量取向极端保守：直连依赖全部 pin 到精确版本、`min-release-age=2`、shrinkwrap 白名单、erasable TypeScript only、`npm run check` 全绿才允许提交。
+5. **execution 问题解决之后，composition 问题浮现**。真实产品不是单进程单界面：TUI / Web / mobile 要同时渲染一个 session，session 要活在长生命周期进程里，插件要能运行时装卸，部分能力必须在另一个进程甚至另一台机器。pi2 的回答是 `chord`——一个**零 Pi 内依赖、可被无关应用复用**的应用组装运行时（facet / service / replicated state / remote boundary）。
+6. **Chord 的真正交付物不是"依赖注入"，而是"能力边界"**。`setup(env)` 的参数表在**类型层面**卡死了插件能拿到什么——presentation facet 永远拿不到裸的 Harness / Session / 工具注册表 / 凭据存储。隔离不是文档约定，是 API 形状。
+7. **稳定 CLI 与实验性分布式架构并行存在**：稳定版 `pi` CLI 仍跑 `Agent` + JSONL `SessionManager`；`AgentHarness` + Chord facet/RPC + session worker 只在 `src/experimental/` 与 `packages/{protocol,client,server,chord}` 中启用。这是本仓库当前最重要的"双轨"事实。
+8. 代码质量取向极端保守：直连依赖全部 pin 到精确版本、`min-release-age=2`、shrinkwrap 白名单、erasable TypeScript only、`npm run check` 全绿才允许提交。
 
 ---
 
@@ -98,6 +119,37 @@ chord → tui → telemetry → ai → agent → session-backends/sqlite-node
 | 服务端 | `server` | 路由、附件生命周期、worker 托管 | 不实现跨 server 路由 |
 | 产品 | `coding-agent` | CLI 交互、扩展加载、工具实现、session 管理、UI | 不做权限系统（README 明示） |
 
+### 2.2 一张图看懂：Application / Chord / Harness / Session 的位置
+
+上表是"包视角"。但理解 pi2 更有效的视角是**运行时视角**——谁负责组装，谁负责执行：
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│  Application                                                          │
+│  一个 Agent 产品 = 多个进程 / 多个界面 / 可插拔扩展                     │
+├───────────────────────────────────────────────────────────────────────┤
+│  Chord   ── composition + boundary ───────────────────────────────────│
+│  facet 组装 · service 绑定 · replicated state · remote 边界            │
+│  它同时定下两件事：「谁提供什么能力」和「谁被允许拿到什么能力」          │
+├──────────────┬────────────────────────────┬───────────────────────────┤
+│ Presentation │  Services                  │  Worker                   │
+│ TUI / Web /  │  catalogue / binding /     │  session worker           │
+│ Mobile / RPC │  subscription / delta      │  （真正持 Harness 的进程） │
+├──────────────┴────────────────────────────┴───────────────────────────┤
+│  AgentHarness  ── execution + recovery ──────────────────────────────│
+│  accept/drive · 13 leaf 总态 · 意图→效果→结算 · 单写者 Drive           │
+├───────────────────────────────────────────────────────────────────────┤
+│  Session                                                              │
+│  不可变 entry 树 · bound value/list · usage ledger（三存储不变式）      │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+读这张图要抓住三点：
+
+1. **Chord 在 Harness 之上，不在其内**。Chord 不认识 Session、Operation、工具；Harness 不认识进程、传输、插件分发。
+2. **Presentation 与 Worker 之间没有直连**。所有跨进程调用都经过 Chord 的 service 边界与 server 的路由——这正是"能力边界"落地的地方（§8.4）。
+3. **上下两半的时间尺度不同**。Harness/Session 关心"跨崩溃仍然正确"（秒到天）；Chord 关心"运行中怎么组合与替换"（毫秒到秒）。这个差异是两者必须分开的根本原因（§7.10）。
+
 ---
 
 ## 3. `pi-ai`：统一多模型 API
@@ -127,7 +179,11 @@ packages/ai/src/
 
 ---
 
-## 4. `pi-agent-core`：AgentHarness 核心（重点）
+## 4. 问题一 · Execution：`AgentHarness` 核心
+
+> **这一节回答第一个问题：一个 Agent 怎么在崩溃、重试、并发的现实里可靠地跑？**
+>
+> 读这一节时请记住一个反直觉的事实：**这套机制的设计目标不是"更快"，而是"崩溃点可枚举"**。它刻意放弃了写放大、放弃了日志重放、放弃了调度器，换取"任意时刻杀进程，重启后结果与没被杀过一致"。这套语义是后面 Chord 存在的**前提**——因为只有当 execution 是可靠的，"把它拆到多个进程里"才是一个可讨论的问题。
 
 ### 4.1 系统模型
 
@@ -353,6 +409,8 @@ SQLite 的两个非显然点：
 
 ## 5. `coding-agent`：终端 harness 产品层
 
+> 这一节是 execution 与 composition 之间的**过渡**。`coding-agent` 是今天的稳定产品形态——单进程、单界面、进程内扩展。它同时给出了两个信号：**（a）** 稳定产品线暂时不需要 Chord；**（b）** 扩展系统已经出现了"多来源、可装卸、需隔离"的苗头，这正是 composition 问题的第一道裂缝。
+
 ### 5.1 四种运行模式
 
 | 模式 | 入口 | 用途 |
@@ -427,11 +485,64 @@ npm run eval -- src/extensions.eval.ts src/models.eval.ts --provider openai --mo
 
 ---
 
-## 6. 实验性分布式架构（Chord + RPC + Worker）
+## 6. 问题二 · Composition：为什么单进程 harness 不够
 
-这是 pi2 相对 pi1 最大胆的部分，也是"未来形态"的所在。
+> **这一节铺平 Chord 所在的问题空间。** 上一节结束时，我们有了一个能在崩溃、重试、并发下可靠执行的单 lane 内核——但它默认"整个应用就是一个进程、一个界面、扩展都在进程内"。真实产品不是这样。
 
-### 6.1 三层职责
+### 6.1 场景：一个 Agent 产品的真实形状
+
+假设这个 Agent 产品要同时满足五件事：
+
+1. **多个界面**：终端 TUI、浏览器 Web UI、移动端、脚本/CI 的 headless 调用——它们都要**看着同一个 session**。
+2. **session 必须活得比界面久**：关掉 TUI 再打开，任务应该还在跑。
+3. **能力必须能跨进程**：工具执行、凭据、模型调用可能需要放在专门的进程里（隔离、权限、资源）。
+4. **插件由第三方编写**：要能运行时装卸、能热替换、能不残留副作用。
+5. **部分能力在远端**：另一台机器、另一个运行时环境。
+
+把它画出来：
+
+```
+        Presentation                     Composition                  Execution
+        ────────────                     ───────────                  ─────────
+   ┌── TUI 终端界面 ──┐
+   ├── Web 浏览器  ───┤              谁提供服务？
+   ├── Mobile App  ───┤              谁需要服务？                ┌──────────────────┐
+   ├── RPC / 脚本  ───┼──────────►   服务现在在哪？      ◄──────  │  AgentHarness    │
+   └── CI / headless ┘              服务断了怎么办？              │  单 lane 持久化   │
+                                    服务能否被远程调用？          │  执行 + 崩溃恢复  │
+                                    状态怎么同步？                └──────────────────┘
+                                    模块升级怎么切换？                     │
+                                    模块卸载时怎么清理？                   ▼
+                                          │                        ┌───────────┐
+                                          ▼                        │  Session  │
+                                    ┌───────────┐                  │  三存储    │
+                                    │   Chord   │                  └───────────┘
+                                    └───────────┘
+                                          │
+                    ┌─────────────────────┼─────────────────────┐
+                    ▼                     ▼                     ▼
+             session worker           server 进程         presentation 进程
+             （真正持 Harness）        （路由 / 附件）      （只渲染，无 agent 状态）
+```
+
+### 6.2 组合问题的清单
+
+上图的左半边，逐条拆开就是 Chord 要回答的问题。注意它们**没有一个是"谁创建谁"**：
+
+| # | 问题 | 传统 DI 能回答吗 |
+|---|---|---|
+| 1 | 谁提供服务、谁需要服务？ | ✅ 能 |
+| 2 | 服务现在**在哪个进程 / 哪台机器**？ | ❌ 不能 |
+| 3 | 服务**断开**了怎么办？消费者要不要自己写重连？ | ❌ 不能 |
+| 4 | 服务**能不能被远程调用**？契约怎么保证？ | ❌ 不能 |
+| 5 | 服务**状态怎么同步**给远端消费者？ | ❌ 不能 |
+| 6 | 模块**升级**时怎么切换，切换期间消费者会不会看到"服务消失"？ | ❌ 不能 |
+| 7 | 模块**卸载**时它注册的东西怎么清理干净？ | ⚠️ 部分 |
+| 8 | 一个功能需要**同时跑在多个环境**（worker / TUI / browser），怎么组织？ | ❌ 不能 |
+
+没有这层基础设施会怎样？**每个团队自己搞 RPC、自己搞插件加载、自己搞状态同步、自己搞生命周期**——然后这四套东西互相不知道对方存在。这就是 pi2 在实验性架构里要回答的问题，也是 `chord` 这个包存在的全部理由。
+
+### 6.3 pi2 给出的答案：三层职责
 
 ```
 ┌─ facet kernel ─────────────────────────────────────────────┐
@@ -462,14 +573,7 @@ server
 
 **没有 presentation → session-worker 的直连**，server 负责路由。
 
-### 6.2 Chord 的核心概念
-
-- **Facet**：`{ id, setup(env) }`，同步声明。异步初始化放 `onActivate()`。
-- **Service**：带类型的稳定 token，singleton 或 keyed。可进程内（任意 JS 契约）或远端可暴露（严格 JSON）。
-- **Replicated state**：生产者改 tracked `state` proxy 并调 `publish(context)`，消费者收到完整不可变值。Chord 每次发布 flush 一批解码后的操作，每个远端 client 拥有独立的 path-codec 状态。
-- **依赖图先验证后绑定**：所有 facet setup 完成后统一校验完整依赖图，provider 先于 consumer 激活，按逆依赖序 dispose。
-
-### 6.3 协议层
+### 6.4 协议层：Chord 之外的那一半
 
 `pi-protocol` v8：
 
@@ -480,9 +584,9 @@ server
 - **分帧**：4 字节大端长度 + 一个定长 CBOR item；decoder 接受任意流式分片与合并
 - 明确不做：peer 鉴权、trace 传播
 
-`pi-protocol` 只校验"是 strict JSON"，**不校验也不导出 Chord 语法**——语义校验在 Chord service adapter 边界完成。这个切分很干净。
+`pi-protocol` 只校验"是 strict JSON"，**不校验也不导出 Chord 语法**——语义校验在 Chord service adapter 边界完成。这个切分很干净：**协议管字节，Chord 管语义**（§7.6 展开）。
 
-### 6.4 `experimental/mini`：最小可用分布式 harness
+### 6.5 `experimental/mini`：最小可用分布式 harness
 
 存在的目的是"从真实 client 压测 harness，找出 RPC 形态的 presentation 到底需要什么"。
 
@@ -503,7 +607,7 @@ tui        tui        tui          presentations：只渲染，无 agent 状态
 - 若该 worker 持有未完成的持久 operation，替代者会**自动从最后记录的恢复状态续跑**。
 - 只有两个动词：**call**（问一次答一次）和 **emit**（发布给监听者），两个方向都可用。
 
-### 6.5 `experimental/services`：实验性服务切片
+### 6.6 `experimental/services`：实验性服务切片
 
 | Scope | Service | 当前切片 |
 |---|---|---|
@@ -517,9 +621,13 @@ tui        tui        tui          presentations：只渲染，无 agent 状态
 | presentation | `SlashCommands` | 进程内命令贡献注册表 |
 | presentation | `PresentationUI` | 进程内选择与状态能力 |
 
-关键约束：**presentation facet 永远拿不到裸的 Harness / Session / tool registry / hook registry / 凭据存储 / storage handle**——只能拿到语义 service 与 replicated state。
+关键约束（**本报告最重要的一条约束**）：
 
-### 6.6 `experimental/pico`（v3 设计）
+> **presentation facet 永远拿不到裸的 Harness / Session / tool registry / hook registry / 凭据存储 / storage handle**——只能拿到语义 service 与 replicated state。
+
+这条约束不是靠文档约定维持的，是靠 Chord 的 API 形状在类型层面卡死的。它是 §8.4 的主题。
+
+### 6.7 `experimental/pico`（v3 设计）
 
 `packages/agent/docs/pico-v3.md`（2113 行）+ `pico-usage-guide.md` 描述的是 harness 的**下一步重构方向**：把内建 agent 行为从"固定调度状态机"改为"由 task 组合"。
 
@@ -535,88 +643,306 @@ Scheduler 只懂 task 生命周期、依赖、时序、取消；不懂 prompt、
 
 ---
 
-## 7. Chord：应用组装运行时（是什么、做什么、怎么用）
+## 7. Chord：pi.dev 给这个问题的答案
 
-§2 已把 `chord` 定位为横向设施。这里展开：它是本仓库中**唯一被设计为可脱离 Pi 存在的包**（见 `packages/chord/README.md` 与 `PLANNING.md`），理解它是理解 §6 实验性分布式架构的前提。
+> §6 已经把问题空间铺平。现在展开答案。
+>
+> 一句话预告全章：**Chord 交付的不是"依赖注入"，而是"能力边界"**——它同时定下"谁提供什么能力"和"谁被允许拿到什么能力"。理解这一点的关键，是看清 `setup(env)` 这个参数表到底给了插件什么、又刻意不给什么（§7.3、§8.4）。
 
-### 7.1 是什么
+### 7.1 为什么需要 Chord
 
-一句话：**Chord 是"把一个应用拆成多个进程/环境中的插件，并用类型化服务把它们再组装起来"的通用运行时**。它不认识 Harness、TUI、Session、工具——只认识 facet、service、replicated state 和字节边界。
+把 §6.2 的清单倒过来读，就是 Chord 的存在理由。三个层面：
+
+**第一层：execution 问题解决了，但它只解决了一个进程内的一条 lane。**
+`AgentHarness` 的语义边界非常清楚——一个 Session、一条 lane、一个 owner、不做复制、不做调度（§4.12）。这不是缺陷，是刻意的克制。但真实产品要把这条 lane 暴露给多个界面、放进一个长生命周期进程、允许第三方扩展它。这些**全都在 Harness 的语义边界之外**。
+
+**第二层：跨进程的"能力组合"缺少一层通用设施。**
+如果没有它，每个团队会各自发明：一套 RPC 约定、一套插件加载器、一套状态同步、一套生命周期管理。这四套东西彼此不知道对方存在，且都无法被复用。Chord 的定位就是把这四件事收进一个**通用、可被无关应用复用**的运行时。
+
+**第三层（也是最关键的）：组合的同时必须划定边界。**
+这是 pi2 与"通用插件框架"最不一样的地方。pi2 的目标不是"让插件能做更多事"，而是**让插件只能做被允许的事**：presentation 插件要能渲染 session、能发命令，但**不能**直接读凭据、不能直接跑工具、不能直接碰 Harness 内部状态。这个边界必须在**类型层面**成立，而不是靠代码评审。
+
+> 所以 Chord 不是为了"更灵活"，而是为了"灵活的同时仍然可治理"。
+
+### 7.2 一句话理解 Chord
+
+**Chord 是"把一个应用拆成多个进程/环境中的插件，并用类型化服务把它们再组装起来"的通用运行时。**
+
+它不认识 Harness、TUI、Session、工具——只认识 facet、service、replicated state 和字节边界。
 
 身份特征（均有源码实证）：
 
 - **零 Pi 内依赖**：`packages/chord/package.json` 的 dependencies 无任何 `@earendil-works/*`；README 原话"it is not a Pi package … can be used by unrelated applications"。这也是它排在构建第一位的原因。
-- **保留命名空间**：Chord 自有标识用 `chord.*`，保留 service 前缀 `$chord.*`；`defineService()` 对 `$chord.` 开头的 id 直接抛错（`src/api.ts:80`）。
+- **保留命名空间**：Chord 自有标识用 `chord.*`，保留 service 前缀 `$chord.*`；`defineService()` 对 `$chord.` 开头的 id 直接抛错（`src/api.ts:80`：`Service IDs beginning with $chord. are reserved`）。
 - **分路径导出**：包根（tokens/hosts/state）、`/context`（`Context` 等通用名特意不污染根 API）、`/delta`（独立 delta 原语）、`/node`（仅 Node 的 bundle loader）、`/bundler`（esbuild 打包）。调用方按需 import，不是一锅端。
 - **体量**：`src/services/` + `delta` + `context` + `node/bundle` 约 3700 行，`facets/host.ts`（FacetKernel）906 行，10 个测试文件。不是小工具，是完整子系统。
 
-### 7.2 做什么：六件套
+### 7.3 Facet：一个组件怎么加入系统
 
-README 列出的六个连贯部件（`packages/chord/README.md:18-58`）：
+**Facet 是"一个插件的不同侧面"。** 这是 Chord 里最容易把人搞晕的词，但它其实非常简单。
 
-| 部件 | 作用 | 关键语义 |
+一个插件可能需要在不同地方运行。例如：
+
+```
+GitHub Plugin
+├── Worker 部分      → GitHub API 调用
+├── Web UI 部分      → GitHub 页面组件
+└── Backend 部分     → Token / 数据服务
+```
+
+这三部分就是三个 facet。
+
+> **Plugin = 一个完整功能；Facet = 这个功能在不同运行环境里的那一部分。**
+
+为什么不直接叫 Plugin？因为普通 Plugin 默认"加载进当前程序"，而 Chord 想做的是"**同一个功能可以拆到多个环境**"。这时候单纯叫 Plugin 已经表达不了了。
+
+数据结构极简：
+
+```ts
+interface Facet {
+  readonly id: string;
+  setup(env: FacetEnvironment): void;   // 必须是同步的
+}
+```
+
+`setup(env)` 的完整动词表（`src/types.ts:206-224`）：
+
+| 方法 | 作用 | 只能在哪个阶段调用 |
 |---|---|---|
-| **Facet** | 同步声明式插件单元 `{ id, setup(env) }`；一个 plugin 可拆成多个 facet，分别跑在 worker / TUI / browser 等进程 | `setup` 必须是同步的；异步初始化一律推迟到 `onActivate()` |
-| **Service** | 类型化稳定 token，`singleton`（一对一）或 `keyed`（一对多动态实例） | 进程内 service 可用任意 JS 契约；**可远端暴露的 service 必须满足 strict-JSON 契约**（`RemoteServiceContract`） |
-| **Replicated state** | 生产者改 tracked `state` proxy → 调 `publish(context)`，消费者收到完整不可变值 | 每次 publish flush 一批解码后操作；每个远端 client/state 配对拥有独立 path-codec 状态；断开后副本变 unready 直到 rehydrate |
-| **Delta tracking** | 从 tracked plain JSON 在 flush 时推导紧凑操作（`/delta` 可独立使用：`track`/`apply`/`applyImmutable`） | 首 flush 永远是完整 base batch；字符串赋值保留纯 append / 滚动窗口 front-truncate 语义，其余回退为 set；支持 durable base batch；应用不可信操作时做校验 |
-| **Remote boundary** | 传输无关的 service wire 语法：`$chord.service` 控制调用（catalogue/subscribe/unsubscribe）、编解码器、错误码 | Chord **只定语法不定传输**：framing、routing、transport、外层 envelope 全由应用方（如 `pi-protocol`）提供；每订阅一对 encoder/decoder，replacement/unavailable/close/rehydrate 时重置 Delta 路径字典 |
-| **Context** | Go 式 context：取消 + invocation 级应用值（权限/telemetry 可搭车，但 Chord 不依赖它们） | 进程内调用权柄；Harness 的 trailing `Context` 参数类型正来源于此（`agent` 包只引用了这一层，见 §7.3） |
+| `use<T>(service)` | 硬依赖一个 singleton，拿到 stable facade | setup 期声明 |
+| `observe<T>(service, handler)` | 订阅 keyed 实例的出现/变化 | **仅 setup 期** |
+| `provide<T>(service, impl)` | 安装 singleton 实现 | setup 期 |
+| `provideMany<T>(service)` | 拿到 `ServiceSpawner`，动态产生 keyed 实例 | setup 期 |
+| `replicatedState<T>(initial)` | 创建一份可发布状态（**按 facet 创建**） | setup 期 |
+| `own(disposal)` | 托管一个清理函数 | setup 期 / active 期 |
+| `onActivate(cb)` / `onDeactivate(cb)` | 异步初始化 / 退役回调 | **仅 setup 期** |
 
-Facet 生命周期（`src/facets/host.ts`，`FacetKernel`）：
+两个设计决定值得单独说：
+
+1. **`setup` 必须同步。** 因为 FacetHost 要先收齐**所有** facet 的声明，才能一次性校验完整依赖图（§7.7）。如果 setup 可以 `await`，一个 facet 就无法确定性地声明完整形状——"先验证后绑定"就做不到了。**异步初始化一律推迟到 `onActivate()`。**
+2. **`env.replicatedState` 是按 facet 创建的。** 这意味着 state 的**生产者身份天然绑定到 facet 生命周期**——facet 退役，它发布的状态自然失去生产者。这是一个很干净的归属关系。
+
+阶段守卫是硬性的，违规直接抛错而不是未定义行为：
 
 ```
 setup → assembling → connecting → activating → active
    ↳ reloading（热替换）/ disposing → dead
 ```
 
-- **先验证后绑定**：全部 facet `setup` 完成 → 统一校验完整依赖图 → provider 先于 consumer 激活 → 按逆依赖序 dispose。setup 失败要清理已分配资源。
-- **阶段守卫**：`observe`/`onActivate` 只能在 setup 期；`own` 可在 setup/active 期；service handle 只能在 active 期使用，dispose 时 revoke。违规直接抛错，不是未定义行为。
-- **热替换不断连**：`FacetHost.reload(candidate)` 让候选 facet 在老 provider 仍在路由的状态下完成激活与校验，然后 singleton 直接替换——普通 reload 下稳定 service handle **不经历 unavailable 间隔**；keyed 实例是 incarnation-specific，替换者拿 fresh generation。
+- `observe` / `onActivate` 只能在 setup 期；
+- `own` 可在 setup / active 期；
+- service handle 只能在 active 期使用，dispose 时 revoke。
 
-### 7.3 怎么用：三层用法（由浅入深）
+### 7.4 Service：组件怎么暴露能力
 
-**第 1 层：只借类型（稳定 Harness 就是这么用的）**
-
-```ts
-// packages/agent/src/harness/context.ts / session/types.ts
-import type { Context, ContextKey } from "@earendil-works/chord";
-import type { JsonValue } from "@earendil-works/chord";
-```
-
-`agent` 包对 chord **全是 `import type`**——稳定版 Harness 根本没用 facet/service 运行时，只复用了 `Context` 与 JSON 类型。这是"横向设施"最有力的证据：连核心层都只取其类型，不取其运行时。
-
-**第 2 层：定义 service + facet（以 session worker 的 Models 服务为例）**
+**Service 是一个带类型的稳定 token。** 定义方式是一行：
 
 ```ts
-// ① 定义 token：接口 + id 一行绑定（packages/coding-agent/src/experimental/services/models.ts）
 export interface Models {
   readonly state: ReplicatedState<ModelsState>;
   cycleThinking(context: Context): Promise<void>;
   refresh(context: Context): Promise<void>;
   select(model: ModelRef, context: Context): Promise<void>;
-  // …
 }
 export const Models = defineService<Models>("pi.models");
-
-// ② 写 facet：setup 里声明提供（models-provider.ts）
-export function createModelsServiceFacet(options: { lane, modelRuntime, settingsManager }): Facet {
-  return defineFacet({
-    id: "@pi/models",
-    setup(env) {
-      const runtime = createModelsService(lane, modelRuntime, settingsManager, env.replicatedState);
-      env.provide(Models, runtime.service);          // 安装 singleton 实现
-      env.onActivate(() => runtime.activate(BACKGROUND_CONTEXT)); // 异步初始化后置
-    },
-  });
-}
 ```
 
-`setup(env)` 的完整动词表（`src/types.ts:206-224`）：`use`（硬依赖 singleton）、`observe`（订阅 keyed 实例）、`provide` / `provideMany`（安装实现）、`replicatedState`（创建可发布状态）、`own`（托管清理函数）、`onActivate` / `onDeactivate`。注意 `env.replicatedState` 是按 facet 创建的——state 的生产者身份天然绑定到 facet 生命周期。
+四个维度：
 
-Service id 命名惯例（实验性代码中的实际用法）：`pi.*`（可远端：`pi.models`、`pi.session-directory`、`pi.agent-controller`…）、`pi.local.*`（`{ local: true }`，纯进程内、可用任意 JS 契约，如 `pi.local.presentation-ui`）、`$chord.*`（保留，应用禁用）。
+| 维度 | 取值 | 含义 |
+|---|---|---|
+| **模式** | `singleton` | 一对一：一个 provider，所有 consumer 共享 |
+| | `keyed` | 一对多：动态实例，consumer 用 `observe` 订阅 |
+| **可见性** | 进程内 | 可用**任意 JS 契约**（函数、类实例、闭包都行） |
+| | 远端可暴露 | **必须满足 strict-JSON 契约**（`RemoteServiceContract`） |
+| **契约** | 类型化 | token 的泛型参数就是契约，编译期检查 |
+| **生命周期** | stable facade | provider 断开或被替换时，**consumer 手里的 handle 仍然有效** |
 
-**第 3 层：组装 host + 插件热加载（`services/worker.ts` 是标准模板）**
+⚠️ 一处**规格与实现的落差**：`src/types.ts:60` 定义 `ServiceMode = "singleton" | "keyed"`；而更晚的规格文档 `facets.md` 里已经出现 `"singleton" | "keyed" | "peer"` 三态。**`peer` 目前只是设计，未落地。**
+
+命名惯例（实验性代码中的实际用法）：
+
+| 前缀 | 含义 | 例子 |
+|---|---|---|
+| `pi.*` | 可远端暴露（strict JSON） | `pi.models`、`pi.session-directory`、`pi.agent-controller` |
+| `pi.local.*` | `{ local: true }`，纯进程内，任意 JS 契约 | `pi.local.presentation-ui` |
+| `$chord.*` | **保留**，应用禁用（`defineService` 直接抛错） | `$chord.service`（wire 层控制通道） |
+
+最后一行值得展开：`$chord.service` 是 Chord 自己在 wire 层用的**控制通道 id**（`src/services/wire.ts:39`），承载 catalogue / subscribe / unsubscribe 三类控制调用（§7.6）。把它标为保留前缀，是为了让应用的 service 命名空间与控制通道永远不冲突。
+
+### 7.5 Replicated State：状态怎么被安全共享
+
+问题：session worker 里正在跑一个任务，TUI 想实时显示"当前 token 数 / 正在执行哪个工具 / 进度 60%"。这个状态**不该进 Session**（它不是对话历史，是易变的实时视图），也**不该由 TUI 自己轮询**（那要重新发明一套同步协议）。
+
+Chord 的答案：
+
+```ts
+const status = env.replicatedState({ output: "", count: 0 });
+status.state.output += "done\n";     // 改 tracked proxy
+status.state.count += 1;
+status.publish(context);             // 发布一次
+```
+
+- **生产者**改 tracked `state` proxy，然后调 `publish(context)`；
+- **消费者**收到**完整不可变值**，不需要理解增量；
+- Chord 每次 publish **flush 一批解码后的操作**（delta），每个远端 client/state 配对拥有**独立的 path-codec 状态**；
+- 副本在断开或替换后变为 **unready**，直到 rehydrate 完成。
+
+**Delta tracking** 是它的底座（`/delta` 可独立使用）：
+
+| 特性 | 说明 |
+|---|---|
+| 首次 flush | 永远是**完整 base batch**（消费者无需先验状态） |
+| 后续 flush | 基于路径的操作（path-based changes） |
+| 字符串优化 | 纯 append / 滚动窗口 front-truncate 保留语义；其余回退为 set |
+| durable base batch | 支持持久化基线 |
+| 不信任输入 | 应用不可信操作时**做校验** |
+| 不保留变更历史 | 从 tracked plain JSON 在 flush 时推导，不存 mutation log |
+
+独立用法示例：
+
+```ts
+import { apply, track } from "@earendil-works/chord/delta";
+
+const changes = track({ output: "", count: 0 });
+changes.flush();                    // opening base batch
+changes.state.output += "done\n";
+changes.state.count += 1;
+
+const ops = changes.flush();
+const replica = apply({ output: "", count: 0 }, ops);
+```
+
+一个必须点明的设计后果：**pi2 因此出现了"两套 state"**。
+
+| | Durable State | Live Distributed State |
+|---|---|---|
+| 载体 | Session（entry 树 / bound value / ledger） | Chord replicated state |
+| 语义 | 跨崩溃仍然正确，永不删除 | 进程活着期间有效，断开即 unready |
+| 时间尺度 | 秒 → 天 | 毫秒 → 秒 |
+| 消费者 | 恢复逻辑、上下文投影 | 界面、其他进程 |
+| 谁负责 | `AgentHarness` | `Chord` |
+
+**这个区分是理解 pi2 的关键之一**：把实时视图塞进 Session 会污染持久化语义（并且每次进度更新都要落盘）；把对话历史塞进 replicated state 会在崩溃后丢失。两者必须分开。
+
+### 7.6 Remote Boundary：这些能力怎么跨进程
+
+跨进程调用需要一套 wire 语法。Chord 的选择是**只定语法，不定传输**。
+
+Chord 拥有的（transport-independent）：
+
+| 组成 | 内容 |
+|---|---|
+| 控制调用 | `$chord.service` 上的 catalogue / subscribe / unsubscribe（`createServiceCatalogueCall()` / `createServiceSubscribeCall()` / `createServiceUnsubscribeCall()`） |
+| 端点处理 | `createRemoteServiceEndpoint()` 处理这些调用，含订阅激活与清理 |
+| 语义解析 | `parseServiceCall()` / `parseServiceCatalogue()` + 解码后的 snapshot / update 解析器 |
+| 错误 | `RemoteServiceErrorCode` / `REMOTE_SERVICE_ERROR_CODES`（跨边界的稳定错误码） |
+| 编解码 | provider 侧 `createServiceStateEncoder()`，consumer 侧 `createServiceStateDecoder()`，每订阅一对 |
+| 类型工具 | `JsonRepresentation<T>`（为未知 payload 的应用数据推导 wire-safe 类型）、`isJsonValue()`（在 adapter 边界校验收到的值） |
+
+Chord **不**拥有（应用方自理）：
+
+- framing、routing、transport
+- 外层 wire envelope
+- 版本握手、鉴权
+
+应用可以把这些值放进**任意** routing / request / response / event 信封——Chord 不规定那个外层协议。在 pi2 里，这个"应用方"就是 `pi-protocol`（§6.4）。
+
+这个切分很干净：**`pi-protocol` 校验"是 strict JSON"，Chord 在校验完的字节上做语义校验。** 两层各管一件事，互不越界。
+
+> 规格里还提到 **symmetric RPC peers**（对称 RPC 对等方）作为这个边界的一种可选实现——目前是 planned，不是已实现。
+
+### 7.7 FacetHost：系统怎么把这些组件装起来
+
+```ts
+const host = await createFacetHost({
+  facets,                    // 要装的 facet 列表
+  serviceSources,            // 可选的远端 service 来源
+  onError,                   // 可选错误回调
+});
+
+host.services                // RemoteServiceProvider —— 对外唯一句柄
+await host.reload(newFacets) // 热替换
+await host.dispose()         // 退役
+```
+
+**先验证后绑定**是核心流程：
+
+```
+① 全部 facet setup() 完成        （只声明，不绑定）
+        ▼
+② 统一校验完整依赖图             （缺 provider / 循环依赖 → 此时报错）
+        ▼
+③ provider 先于 consumer 激活    （保证 consumer 激活时依赖已就绪）
+        ▼
+④ 按逆依赖序 dispose            （consumer 先走，provider 后走）
+```
+
+补充细节：
+
+- **setup 失败要清理已分配资源**——不能留下半初始化的世界。
+- `host.services` 是**唯一对外的句柄**，类型是 `RemoteServiceProvider`。应用拿不到 facet 列表、拿不到 kernel 内部结构。
+- **FacetLoader** 是加载抽象：`load(): Promise<LoadedFacets>`。提供 `createStaticFacetLoader()`（内置 facet）与 `combineFacetLoaders()`（组合多个来源）。
+
+这套流程的直接效果：**依赖缺失或成环是启动期错误，不是运行期惊喜。**
+
+### 7.8 Plugin Reload：运行中的组件怎么替换
+
+替换一个正在服务的插件，难点是"替换期间 consumer 会不会看到服务消失"。Chord 的答案是**三段式**（`worker.ts:84-103` 的 `reloadPlugins`，用串行 `reloadTail` 保证不并发）：
+
+```
+candidate = await pluginLoader.load()
+await facetHost.reload(candidate.facets)   // 失败 → dispose candidate，抛错
+retired   = loadedPlugins; loadedPlugins = candidate
+await retired.dispose()                    // 成功之后才退役老的
+```
+
+关键性质：
+
+| 性质 | 说明 |
+|---|---|
+| **候选先激活** | 新 facet 在**老 provider 仍在路由**的状态下完成激活与校验 |
+| **原子切换** | 校验通过后 singleton 直接替换——普通 reload 下**稳定 service handle 不经历 unavailable 间隔** |
+| **keyed 例外** | keyed 实例是 incarnation-specific，替换者拿 **fresh generation**（旧实例的订阅者要 rehydrate） |
+| **失败即回滚** | reload 抛错 → dispose candidate，老 provider 完全不动 |
+| **形状保持** | 按 `Facet.id` 的 shape-preserving replacement 允许，前提是新 facet 声明**完全相同的 manifest** |
+
+最后一条有个重要细节（`facets.md`）：因为 manifest 是**静态**的，这个检查发生在**构造候选之前**——比"跑一遍 setup 看形状对不对"好得多。结构性变更则需要图重装或进程重启。
+
+**插件分发链**（bundler → manifest → loader，`README:124-204`）：
+
+```
+TS/ESM 入口
+   │  @earendil-works/chord/bundler（esbuild）
+   ▼
+内容寻址的独立 .cjs + chord-facets.json
+   │   peerDeps 外部化；从不装依赖、不跑 lifecycle
+   ▼
+createFacetBundleLoader（Node-only）
+   │   每次 load() 验 SHA-256
+   │   用 node:vm 直接编译（不进模块缓存）
+   │   dispose 退役 generation 后编译产物可 GC
+   ▼
+输出目录：先写临时目录 → 原子替换（loader 永远看不到半成品）
+```
+
+`package.json` 里用 `chord.facets` 声明 facet 入口映射，值为 `worker` / `presentation` / `false`（`false` 表示在该环境禁用）。
+
+**为什么是"拆掉消费者"而不是"代理换实现"？**
+
+`facets.md` §13.1（"Teardown, not swapping"）专门论证了这一点，值得引用：Chord 拒绝"给每个依赖方套一个代理、在背后换实现"的模型。理由有三层——
+
+- **OSGi 两种都提供**，但它自己的指引把 `STATIC` 设为默认，因为 dynamic 要求**每个** consumer 都对"服务调用中途消失"做防御。
+- **Cordis 就是代理模型**：`ctx.get(name)` 在服务不存在时返回 `undefined`，而官方指引是"handle their absence"——**防御性检查是被推荐的路径**。
+- **缓存的引用让代理更糟，不是更好**：Cordis 的守卫在**访问路径**上，不在**值**上——`ctx.foo` 在服务没了会抛，但你存下来的引用照常工作，直接调进已死插件的闭包里。
+
+pi 的选择：`ctx.use(Token)` **在设计上就在构造期返回值**——代价是同样的隐患，但"**依赖方随 provider 一起销毁**"让它是安全的。**代理不修复缓存引用，它只是把"不可能"变成"静默错误"。**
+
+### 7.9 一个完整例子：TUI → Service → Worker → Harness
+
+把前面所有零件串起来。场景：用户在一个 TUI 里输入 prompt，任务实际在另一个进程里跑，进度实时回显。
+
+**① 组装（worker 进程，标准模板）**
 
 ```ts
 const builtins = await createStaticFacetLoader([
@@ -625,31 +951,378 @@ const builtins = await createStaticFacetLoader([
   createModelsServiceFacet(options),
   createTranscriptServiceFacet(options.lane),
 ]).load();
+
 const pluginLoader = options.facetLoader ?? createStaticFacetLoader([]);
-facetHost = await createFacetHost({ facets: [...builtins.facets, ...loadedPlugins.facets] });
-// facetHost.services 即 provider；reload 路径见下
+const loadedPlugins = await pluginLoader.load();
+
+facetHost = await createFacetHost({
+  facets: [...builtins.facets, ...loadedPlugins.facets],
+});
 ```
 
-插件 reload 用"候选—切换—退役"三段式（`worker.ts:84-103` 的 `reloadPlugins`，串行 `reloadTail` 保证不并发）：
+**② 定义 service 与 facet（以 session worker 的 Models 服务为例）**
+
+```ts
+// ① 定义 token：接口 + id 一行绑定（experimental/services/models.ts）
+export interface Models { /* … */ }
+export const Models = defineService<Models>("pi.models");
+
+// ② 写 facet：setup 里声明提供（models-provider.ts）
+export function createModelsServiceFacet(options): Facet {
+  return defineFacet({
+    id: "@pi/models",
+    setup(env) {
+      const runtime = createModelsService(options.lane, options.modelRuntime, options.settingsManager, env.replicatedState);
+      env.provide(Models, runtime.service);                        // 安装 singleton 实现
+      env.onActivate(() => runtime.activate(BACKGROUND_CONTEXT));  // 异步初始化后置
+    },
+  });
+}
+```
+
+**③ 端到端时序**
 
 ```
-candidate = await pluginLoader.load()
-await facetHost.reload(candidate.facets)   // 失败 → dispose candidate，抛错
-retired = loadedPlugins; loadedPlugins = candidate
-await retired.dispose()                    // 成功后才退役老的
+TUI                    server                 session worker S0              Harness
+ │                       │                          │                          │
+ │ 用户输入 prompt        │                          │                          │
+ ├─ AgentController ────►│                          │                          │
+ │  (remote service 调用) │  路由到持有该 session 的   │                          │
+ │                       ├─ worker ────────────────►│                          │
+ │                       │                          ├─ accept(run) ───────────►│ 落盘 operation
+ │                       │                          │                          │ （不启动任何工作）
+ │                       │                          ├─ drive({operationId}) ──►│ 安装 pass
+ │                       │                          │                          ├─ 13 leaf 状态机推进
+ │                       │                          │                          ├─ 工具：意图→效果→结算
+ │                       │                          │◄─ transcript 状态变化 ────┤
+ │                       │                          ├─ publish(context)        │
+ │◄─ delta（path ops） ───┼──────────────────────────┤  （replicated state）    │
+ │  渲染进度 / 输出        │                          │                          │
+ │                       │                          │                          │
+ │ 插件热加载：pluginLoader.load() → facetHost.reload() → 老 provider 退役（§7.8）
 ```
 
-插件分发链（bundler → manifest → loader，`README:124-204`）：`@earendil-works/chord/bundler` 用 esbuild 把 TS/ESM 入口打成**内容寻址的独立 `.cjs` + `chord-facets.json`**（peerDeps 外部化、从不装依赖不跑 lifecycle）；`createFacetBundleLoader`（Node-only）每次 `load()` 验 SHA-256、用 `node:vm` 直接编译（不进模块缓存），dispose 退役 generation 后编译产物可 GC；输出目录先写临时目录再原子替换，loader 永远看不到半成品。`package.json` 里 `chord.facets` 声明 facet 入口映射（`worker` / `presentation` / `false` 禁用）。
+**④ 关键点回扣**
 
-### 7.4 为什么是这个形状：回扣 §6 的约束
+| 观察 | 对应机制 |
+|---|---|
+| TUI 不知道 Harness 在哪、怎么 RPC | Chord service 边界（§7.4、§7.6） |
+| 关掉 TUI 再打开，任务还在跑 | worker 持有 Harness，operation 已落盘（§4.5 accept/drive 分离） |
+| 进度是实时的，但**没进 Session** | replicated state 是 Live Distributed State（§7.5） |
+| 插件替换时 TUI 没看到服务消失 | 候选先激活 + 原子切换（§7.8） |
+| TUI 拿不到凭据 / 工具注册表 | `setup(env)` 参数表在类型层面卡死（§8.4） |
 
-Chord 的 API 形状直接解释了 §6.5 的关键约束"presentation facet 永远拿不到裸 Harness"：facet 能拿到的只有 `FacetEnvironment` 给的能力（service handle + replicated state + own/onActivate）——**没有"逃逸到 host 全局"的后门**。隔离不是靠文档约定，是靠 `setup(env)` 的参数表在类型层面卡死的。同样，§6.4 mini 的"call/emit 两动词 + server 路由"正好落在 Chord 不管的那一块（transport/envelope 应用自理），两者是互补关系而非重复。
+### 7.10 为什么 Harness 与 Chord 必须分开
 
-一句话：**Chord 是"多进程插件组装"的通用答案，Harness 是"单 lane 持久化执行"的专用答案**；实验性架构 = 用前者装配后者，presentation 与 session worker 只是装到了不同进程的 facet。
+这不是"顺手分了个包"，而是**三个维度上都不该合并**：
+
+| 维度 | `AgentHarness` | `Chord` |
+|---|---|---|
+| **核心不变式** | "payload 只存在于 entry / bound value-list / ledger 三者之一" | "依赖图先验证后绑定，逆序 dispose" |
+| **时间尺度** | 跨崩溃仍然正确（秒 → 天） | 运行中组合与替换（毫秒 → 秒） |
+| **依赖方向** | 只 `import type` chord（`Context` / `JsonValue`） | 零 Pi 内依赖 |
+
+第三行是最硬的证据。看 `agent` 包对 chord 的实际引用：
+
+```ts
+// packages/agent/src/harness/context.ts / session/types.ts
+import type { Context, ContextKey } from "@earendil-works/chord";
+import type { JsonValue } from "@earendil-works/chord";
+```
+
+**全是 `import type`。** 稳定版 Harness 根本没用 facet / service 运行时，只复用了 `Context` 与 JSON 类型。连核心层都只取其类型、不取其运行时——这是"横向设施"最有力的证据，也是"两者职责不同"最直接的证明。
+
+如果强行合并会怎样：
+
+- Chord 就得懂 Session / Operation / 工具参数 / hook 语义 → 它不再是"可被无关应用复用"的通用运行时；
+- Harness 就得懂进程、传输、插件分发、generation 管理 → 它的三存储不变式会被外部生命周期污染。
+
+正确的组合方式是**装配，不是合并**：
+
+> **实验性架构 = 用 Chord 装配 Harness。** presentation 与 session worker 只是被装到了不同进程的 facet 里；Harness 本身完全不知道自己被装进了什么容器。
+
+一句话总结本节：
+
+> **`AgentHarness` 是"单 lane 持久化执行"的专用答案；`Chord` 是"多进程插件组装"的通用答案。前者是后者的被装配对象，不是它的一个模块。**
+
+### 7.11 Chord 与 DeepSeek Harness 的对应关系（速览）
+
+既然两边都在做"插件 + 服务 + 上下文 + 动态组合"，自然会想对齐。先把**能对上的**列出来：
+
+| 概念 | Chord | dsh / Cordis |
+|---|---|---|
+| 插件单元 | `Facet { id, setup(env) }` | `Plugin`（挂到 `ctx` 上） |
+| 能力暴露 | `Service<T>`（singleton / keyed） | `ctx.provide()` / `ctx.get()` |
+| 依赖声明 | `env.use(Service)` / `observe` | `inject = [...]`（未就绪则 PENDING） |
+| 状态共享 | `replicatedState` + delta | 共享 `ctx` 上的 service 状态 |
+| 副作用回收 | `env.own(disposal)` + onDeactivate | `ctx.effect(() => disposer)` |
+| 热替换 | `FacetHost.reload()`（候选→切换→退役） | 改配置 → 卸载旧插件 → 加载新插件 |
+| 上下文 | `Context`（Go 式：取消 + invocation 值） | `ctx`（上下文 + 服务容器） |
+
+但**对齐到这一步就必须停住**。三个层次必须分开说，否则会得出错误结论：
+
+| 判断层次 | 结论 |
+|---|---|
+| **概念相似** | ✅ 大量重叠。"插件 + 服务 + 上下文 + 可逆副作用"是共同词汇。 |
+| **实现相同** | ❌ 不同。最典型的：Chord 是 `use(Token)` 构造期返回值 + **拆掉依赖方**；Cordis 是 `ctx.get(name)` 访问期守卫 + **代理换实现**（`facets.md` §13.1 明确论证了为什么 pi 拒绝后者）。 |
+| **架构位置相同** | ❌ **完全不同**。这是最关键的一点，详见 §9。 |
+
+**架构位置**的差异一句话概括：
+
+> **Cordis 是"怎么把一个程序拼起来"（进程内的插件树 / 应用框架）；Chord 是"怎么把已经运行起来的多个模块连接起来"（跨进程的运行时连接器）。**
+
+由此推出两者最根本的不同，也是本报告认为最值得记住的一条：
+
+| | pi2 | dsh |
+|---|---|---|
+| Agent Loop 的地位 | **不可替换的执行内核**（`AgentHarness` 有自己的不变式与规范） | **本身就是一个 plugin**（"不存在需要打补丁的特权内核"） |
+| 组合发生在哪 | **内核之外**：把 Harness 当作一个被装配的模块 | **内核之内**：Agent 本身被拆成插件树 |
+| 隔离的边界 | 跨进程 / 跨运行环境（facet 在不同环境） | 同进程内的插件边界（`ctx.isolate` 可做作用域隔离） |
+
+完整对照见 §9。
 
 ---
 
-## 8. 与 pi1（pi-mono）的架构演进
+## 8. Chord 与依赖注入（DI）容器：像什么、不像什么
+
+### 8.1 传统 DI 回答的问题
+
+以 NestJS 为例：
+
+```
+UserService
+   │
+   ├── UserRepository
+   └── Logger
+```
+
+你声明 `UserService needs UserRepository`，容器负责：创建 → 注入。
+
+它回答的是一个很具体的问题：
+
+> **"这个对象需要哪些其他对象？"**
+
+即 `Object A → depends on → Object B`。这是经典 DI 的全部。
+
+### 8.2 Chord 多回答了什么
+
+Chord 面对的图不是 `A → B`，而是：
+
+```
+Browser  ──┐
+Worker   ──┤
+Backend  ──┼──►  ？
+Worker 2 ──┘
+```
+
+它要回答 §6.2 那张清单上的八个问题。所以更准确的说法是：
+
+> **Chord 不是"不用 DI"，而是不满足于 DI。**
+
+```
+传统 DI
+   └─ 解决：依赖注入
+
+Chord
+   └─ DI
+      + Service discovery / binding
+      + Lifecycle（setup → activate → dispose，含失败清理）
+      + Remote binding（跨进程 / 跨运行环境）
+      + State replication（replicated state + delta）
+      + Dynamic composition（候选→切换→退役）
+```
+
+一句话：**传统 DI 解决"谁创建谁"；Chord 解决"谁在什么时候活着、在哪儿活着、谁被允许拿到什么"。**
+
+### 8.3 为什么 Chord 不用 `ctx.get(name)` 那套代理模型
+
+这是 Chord 与 Cordis 最具体、最可验证的实现差异，值得单独说清（依据 `facets.md` §13.1）。
+
+| | `ctx.get(name)` 代理模型（Cordis） | `env.use(Service)` token 模型（Chord） |
+|---|---|---|
+| 服务缺失时 | 返回 `undefined`，官方指引是"handle their absence" | 不存在这种状态——依赖图在启动期就已校验 |
+| 守卫位置 | **访问路径**上（`ctx.foo` 会抛） | **构造期**：`use()` 返回一个值 |
+| 缓存引用 | 存下来的引用**照常工作**，直接调进已死插件的闭包 | 同样有隐患，但**依赖方随 provider 一起销毁** |
+| 替换语义 | 代理换实现，consumer 不被拆掉 | **拆掉依赖方**，重建 |
+| 代价 | 每个 consumer 都要写防御代码 | 替换粒度更粗（结构性变更要图重装） |
+
+关键判断（原文意思）：**代理不修复缓存引用问题，它只是把"不可能"变成"静默错误"。** 而"拆掉依赖方"之所以安全，正是因为**持有者随提供者一起死**。
+
+pi 也没有把这条路堵死。`facets.md` 记录了一个**推迟的（deferred, not adopted）**方案：如果将来发现"拆掉依赖方"太粗，加的不是 OSGi 式的动态策略，而是 HMR 式的 `accept()`——一个**按依赖粒度**的选择加入：
+
+```
+uses: [Harness, accepts(Models)]
+  = 我的获取可以被重新指向 / 我不从该 provider 派生状态 / 我不持有指向它的在途注册
+```
+
+kernel 只在 schema 双向可赋值时允许替换，否则**静默回退到拆掉依赖方**。文档的原话很值得记：**"拆掉依赖方必须始终是那条永远可用的路"**——一旦 `accepts` 成为正确性的必要条件，所有 consumer 就又开始写防御代码了。
+
+### 8.4 能力边界：为什么 Chord 故意不让插件拿到 Harness
+
+这是 Chord 最容易被误解、也最重要的一点。
+
+§6.6 那条约束——"presentation facet 永远拿不到裸的 Harness / Session / tool registry / hook registry / 凭据存储 / storage handle"——**不是靠代码评审守住的，是靠 API 形状守住的**。
+
+看 `setup(env)` 的参数表。插件能拿到的全部东西：
+
+```
+env.use(Service)            → 一个稳定 facade
+env.observe(Service, h)     → 一个订阅回调
+env.provide(Service, impl)  → 安装自己实现的能力
+env.provideMany(Service)    → 产生 keyed 实例
+env.replicatedState(init)   → 创建可发布状态
+env.own(disposal)           → 托管清理
+env.onActivate(cb)          → 异步初始化
+env.onDeactivate(cb)        → 退役回调
+```
+
+**没有 `env.host`、没有 `env.getHarness()`、没有 `env.registry`、没有全局单例。** 想要什么能力，就必须先有人把它声明成一个 `Service` 并 `provide` 出来——而且**提供方自己决定契约长什么样**（比如 `AgentController` 只暴露"面向 presentation 的 `AgentLane` 安全门面"，而不是裸 `AgentLane`）。
+
+这就是为什么本报告反复强调：
+
+> **Chord 的真正交付物不是"依赖注入"，而是"能力边界"。**
+
+它同时定下两件事：
+
+1. **谁提供什么能力**（service binding / dependency graph）；
+2. **谁被允许拿到什么能力**（`setup(env)` 的参数表 + service 契约 + 跨进程 strict-JSON 边界）。
+
+而且这个边界是**三道**的，不是一道：
+
+| 边界 | 机制 | 拦住什么 |
+|---|---|---|
+| 类型边界 | `FacetEnvironment` 参数表 | 插件拿到 host 内部对象 |
+| 契约边界 | `Service<T>` 的泛型 + `RemoteServiceContract` | 拿到不该拿的方法 / 传不该传的数据 |
+| 进程边界 | facet 在不同进程加载，跨进程只能走 strict JSON | 进程内逃逸（`import` 到别的模块） |
+
+一个"可组合的插件系统"如果没有第三道，隔离就只是礼节。Chord 把三道都做进去了——**这才是它值得单独研究的理由**。
+
+---
+
+## 9. 与 DeepSeek Harness（dsh / Cordis）的对照
+
+> **方法声明与证据等级。** 本节分两类证据，务必区分：
+> - **一手证据**：pi 仓库内对 Cordis / DSH 的直接评价（`packages/agent/docs/mobile-handoff/02-plugins/01-facets/facets.md` §13.1–13.2），以及 Chord 源码。
+> - **二手证据**：dsh 与 Cordis 的公开资料（2026-08/09）：官方仓库 `deepseek-ai/DeepSeek-Harness`（MIT，2026-08-13 发布 Developer Preview，CLI 名 `dsh`，官方明示"THERE WILL BE COMPATIBILITY-BREAKING CHANGES"）、底层元框架 `cordiverse/cordis`（源自 Koishi，作者 Shigma）、以及第三方架构拆解文章。
+>
+> dsh 未在本工作区留存源码，二手结论以 preview 期文档为准，可能随版本漂移。
+
+### 9.1 两个系统各是什么（先分清 dsh 与 Cordis）
+
+这两个名字不能混用：
+
+| 名称 | 是什么 | 关系 |
+|---|---|---|
+| **Cordis** | 一个**元框架**（meta-framework）：规定"副作用如何组合、依赖如何解析"，不预设业务领域。源自 QQ 机器人框架 Koishi，2022 年独立成 npm 包 | dsh 的**底层** |
+| **DeepSeek Harness（dsh）** | DeepSeek 开源的 **Agent Harness 产品**：把模型适配器、工具注册表、会话日志、Agent Loop、沙箱、审批、UI 组合成能执行任务的 Agent | **建在 Cordis 之上** |
+
+Cordis 的五个核心概念：**插件、上下文、注入、事件、可逆副作用**。
+
+```
+export function apply(ctx: Context) {
+  ctx.on('some/event', (payload) => { /* ... */ })   // 监听（卸载时自动移除）
+  ctx.effect(() => { /* ... */ })                    // 注册副作用（卸载时自动回滚）
+  ctx.plugin(SomePlugin)                             // 挂载子插件（随父卸载）
+  ctx.get('someService')                             // 读服务（不存在则 undefined）
+  ctx.provide('someValue', 42)                       // 提供服务
+}
+```
+
+dsh 的自我描述：**不存在需要打补丁的特权内核**——模型、工具、session、Agent Loop 全部可以是 plugin。
+
+### 9.2 概念相似之处（但别急着说"同一个东西"）
+
+| # | 设计关切 | pi2（§4–§8） | dsh / Cordis | 相似度 |
+|---|---|---|---|---|
+| 1 | 插件组装 substrate | **Chord**：facet（`setup(env)`）+ service token（singleton/keyed）+ replicated state + 热替换不断连 | **Cordis**：插件挂到 `ctx`，`inject` 声明依赖，typed events 协作，**reversible effects**（卸载即回滚注册与副作用） | 高。连"可被无关应用复用"都一致（Chord 自称 not a Pi package；Cordis 是独立 meta-framework） |
+| 2 | 会话即 append-only 日志 | 不可变 entry 树 + `scanBranch` 投影；compaction 是自包含检查点 | append-only `SessionEvent` 日志是唯一真相源；模型历史由投影派生；resume/fork/replay/search 消费同一事件流 | 高。dsh 的"凡展示给模型的一定能从日志重建" ≈ pi 的三存储不变式 + 上下文投影规则（§4.10） |
+| 3 | 接口与驱动分离 | `Agent`（稳定）vs `AgentHarness`（持久化新内核） | `agent`（`Agent` 接口 + live registry）vs `agent-loop`（默认驱动）；扩展只依赖 `agent` | 中高。形状一致，**性质不同**：pi 是迁移期双轨，dsh 是原生 seam |
+| 4 | 执行拦截点 | 11 个 hooks（三类持久性；`before_drive`/`before_tool` fail-closed） | waterfall 事件（`tools/pre-execute → tools/execute → tools/post-execute`；不调 `next()` 即否决） | 中。都是"请求/工具/turn 三处设卡"，但 pi 的 hook 绑定**持久性**，dsh 的 waterfall 绑定**放行权** |
+| 5 | 外部效果安全 | 意图 → 不确定效果 → 结算；每调用声明 `replay: safe \| never` | 受控工具管道 + 审批策略 + 沙箱/执行 provider seam（把 fs/subprocess 指向远端 sandbox） | 中。同一焦虑、两种解法：pi 把"崩溃后重不重放"写进**持久化契约**；dsh 把"能不能执行"交给**策略与执行环境隔离** |
+| 6 | 产品组装 | Pi Packages + facet bundle（esbuild/CJS/manifest/SHA-256/`node:vm`） | profiles = 有序 bundle 栈 + patches（`dsh-base` + `web`/`headless`/`sdk`/`acp`）；`dsh config` 可看最终合成树 | 中高。都是"有序叠加 + 覆盖"；dsh 的"可见的最终合成树"值得 pi 学 |
+
+**六组里六组都能对上——所以更要小心。** 下面的三节说明为什么"能对上"不等于"同一个东西"。
+
+### 9.3 实现不同的地方（同名机制，做法不同）
+
+| 关切 | Chord 的做法 | Cordis / dsh 的做法 | 差异实质 |
+|---|---|---|---|
+| **服务获取** | `env.use(Token)`：**构造期**返回稳定值；依赖图启动期校验 | `ctx.get(name)`：**访问期**查找，缺失返回 `undefined`，指引"handle their absence" | 守卫位置：构造期 vs 访问期 |
+| **替换语义** | **拆掉依赖方**（teardown of dependents）；持有者随提供者一起死 | **代理换实现**；consumer 保持存活，`inject` 让插件进入 PENDING 并在服务回归时自动重激活 | Chord 拒绝代理模型，理由见 §8.3（缓存引用会被静默污染） |
+| **副作用回收** | `env.own(disposal)` + `onDeactivate`；资源所有权绑定 facet 作用域 | `ctx.effect(() => disposer)`；**所有对上下文的变更最终都归结为 `ctx.effect` 这一个原语** | Cordis 的模型更统一（单一原语）；Chord 的模型更显式（分阶段守卫） |
+| **命名/键** | 强类型 token + `chord.*` 命名空间 + `$chord.*` 保留前缀（冲突在定义期抛错） | 字符串键 `ctx.get('name')` + 论文提出的 **coeffect 类型表 Σ**（每个键有静态类型） | 前者靠 token 对象与保留前缀，后者靠类型系统对字符串键建模 |
+| **事件地位** | harness 事件是**被动观察**（§4.9"永不驱动执行"）；**Chord 甚至没有 event bus** | typed events 是**一等协调机制**；`waterfall` 是 dsh 最常用的派发模式 | 相反的设计取向 |
+| **隔离原语** | 跨进程 facet（进程/环境即边界）+ service 契约 | `ctx.isolate(key, realm)` 作用域隔离 + `ctx.intercept(key, meta)` 依赖访问拦截 | Chord 的边界是**进程级**；Cordis 的是**作用域级** |
+
+### 9.4 架构位置不同的地方（本节的核心结论）
+
+前面两节是机制对比。这一节是**位置**对比——也是最容易搞错的地方。
+
+```
+                    Application Architecture
+                            │
+              ┌─────────────┴─────────────┐
+              │                           │
+          Cordis                        Chord
+              │                           │
+     "程序内部怎么组织"            "运行时模块怎么连接"
+              │                           │
+        Plugin Tree                  Service Graph
+        DI / inject                  Local / Remote
+        Event / waterfall            Replicated State
+        Reversible effects           Facets / lifecycle
+              │                           │
+        application framework       application runtime
+```
+
+三条分界线：
+
+**第一：Cordis 是"组装程序"，Chord 是"连接运行中的模块"。**
+
+```
+Plugin A / Plugin B / Plugin C      Browser / Worker / Backend / Service
+        ↓                                        ↓
+      Cordis                                   Chord
+        ↓                                        ↓
+    Application                        （运行起来之后，这些东西怎么互相提供能力）
+（程序怎么被组装起来）
+```
+
+**第二：remote 是 Chord 的设计中心，不是 Cordis 的。**
+
+Chord 明确定义了 `local service` / `remote service` / `service subscription` / `state snapshot` / `state update`，并专门设计了 service catalogue、remote binding、replicated state。Cordis 的主要抽象仍是 `ctx` / `plugin` / `event` / `effect`——它有 `isolate` 与 `intercept`，但**远程服务边界不是它的核心设计中心**。
+
+**第三：Agent Loop 的地位完全相反。**
+
+| | pi2 | dsh |
+|---|---|---|
+| Agent Loop | **不可替换的执行内核**：`AgentHarness` 有独立规范（`harness.md` 1468 行）、自己的不变式、自己的非目标清单 | **就是一个 plugin**：官方明示"不存在需要打补丁的特权内核" |
+| 组合的位置 | 在**内核之外**——把 Harness 当作被装配的模块 | 在**内核之内**——把 Agent 本身拆成插件树 |
+| 由此得到的哲学 | "给应用一个稳定的运行时骨架，让模块通过 Service/Facet 接入" | "一切皆插件，核心也不要成为特权" |
+
+这一条是**最根本的差异**，也是回答"两者是不是在解决同一个问题"的关键：
+
+> **它们不是同一个问题的两种解法。** dsh 在回答"一个 Agent 应用内部怎么被插件化组装"；Chord 在回答"一个已经插件化的应用，其模块怎么跨进程/跨环境互相提供能力"。
+>
+> **两者甚至可以组合**：Cordis 负责**进程内**的插件组合，Chord 负责**进程之间**的服务组合。这不是二选一。
+
+一处**直接的一手证据**，说明 pi 的作者确实认真读过并比较过 Cordis 与 DSH——`facets.md` §13.2 对两者在"退役时在途工作"上的处理：
+
+> "Neither reference system solves this. Cordis's `_unload` is `await Promise.all(disposers)` with a try/catch and no deadline — a disposer that hangs hangs the reload. **DSH goes further and places the obligation on the tool author**: async work must *'observe or forward `exec.signal` and settle only after'* reaching *'quiescence'*, with the registry rechecking cancellation afterwards. That is the settlement concept Cordis lacks, but **it is stated in prose and enforced by nothing**, so a tool that ignores its signal still wedges the unload."
+
+pi 因此提出四阶段退役（Deregister → Signal → Race a deadline → Settle by outcome），并指出**后两阶段是两个参考系统都没有的**。注意这里的措辞：pi 承认 DSH 有 settlement 概念而 Cordis 没有——**这是"实现不同"层面的准确判断，不是"我们一样"的拉平**。
+
+### 9.5 pi 可从 dsh / Cordis 借的三件事（具体）
+
+1. **`dsh config` 式最终合成树可视化**：facet/bundle 叠加后"实际生效的是什么"今天只能靠读代码；dsh 把它做成了一等命令。§6 的 facet 排查成本会大降。
+2. **reversible effects 作为扩展 API 契约**：pi 的扩展卸载/热替换今天靠人工写对清理（`worker.ts` 的 `retired.dispose()`）；Cordis 把"注册即附带撤销"做进框架（所有上下文变更归结为 `ctx.effect`）。可直接对标 Chord 的 `own()` 机制补齐——**但要注意 §8.3 的取舍**：Cordis 的统一原语是有代价的（代理模型），照搬会丢掉 Chord 现在的能力边界。
+3. **projection seam 的增量折叠**：dsh 的 session projection 对已提交事件增量 fold，做成**注册表 + 多消费者共享**；pi 的 `reduceLaneSnapshot` 是同构思想，但目前是客户端各自调用——多 presentation 场景下 dsh 的形态更省。
+
+反过来，dsh 若借鉴 pi，最值得拿的是**§4 的崩溃恢复完备性**与**§4.9 的"事件不驱动"纪律**——这两样在 dsh 的公开文档里找不到等价物。
+
+---
+
+## 10. 与 pi1（pi-mono）的架构演进
 
 | 维度 | pi1 `pi-mono` 0.67.68 | pi2 `pi` 0.85.1 |
 |---|---|---|
@@ -660,48 +1333,15 @@ Chord 的 API 形状直接解释了 §6.5 的关键约束"presentation facet 永
 | 崩溃恢复 | 无正式语义 | 13 leaf 总态重启点 + orphan 恢复表 + 意图/结算两段提交 |
 | 扩展边界 | 进程内 extension API | extension API（稳定）+ facet/service/RPC（实验） |
 | 遥测 | 无独立包 | `telemetry` 独立契约包 + typed schema |
+| 组合能力 | 无 | `chord`（通用组装运行时，可脱离 Pi 复用） |
 | 供应链 | 无特别说明 | pin + min-release-age + shrinkwrap 白名单 + CI audit |
 | 发布形态 | npm 包 | npm 包 + 单文件二进制（`bun build --compile`）+ 版本化 source archive + SHA256SUMS |
 
-**一句话概括**：pi1 是"能用的极简 coding agent"；pi2 是"把 agent 运行时的持久化与并发语义做成可证明的工程系统"，同时为多进程/多 presentation 形态预留了完整骨架。
+**一句话概括**：pi1 是"能用的极简 coding agent"；pi2 是"把 agent 运行时的持久化与并发语义做成可证明的工程系统"（execution），**并在此基础上长出了一层通用的应用组装运行时**（composition），为多进程/多 presentation 形态预留了完整骨架。
 
 ---
 
-## 9. 与 DeepSeek Harness（dsh）的设计对照
-
-> 方法声明：本节基于 dsh 公开资料（2026-09-11 前后）的静态分析，未 clone 其源码：官方仓库 `deepseek-ai/deepseek-harness`（MIT，2026-08-13 v0.1 Developer Preview，CLI 名 `dsh`）、官方文档站 `deepseek-harness.github.io/deepseek-harness`、Cordis 论文《A Programming Paradigm for Spatiotemporal Composability》（arXiv:2608.25512）。dsh 自称"THERE WILL BE COMPATIBILITY-BREAKING CHANGES"，下述结论以 preview 文档为准，可能随版本漂移。
-
-### 9.1 dsh 一句话速写
-
-**dsh = Cordis 之上的"一切皆插件"agent 运行时**：模型适配、工具注册表、会话日志、agent loop 本身（乃至 skills、存储、sandbox、调度、UI）全部是挂在共享 `ctx` 上的可替换插件，没有必须先打补丁的特权核心。`model + harness = agent`——模型只管推理，harness 管工具、环境、会话、权限、sandbox 与执行循环。
-
-### 9.2 六组对照：像的地方是真像
-
-| # | 设计关切 | pi2（本报告 §2–§7） | dsh | 相似度 |
-|---|---|---|---|---|
-| 1 | 插件组装 substrate | **Chord**：facet（`setup(env)`）+ service token（singleton/keyed）+ replicated state + 热替换不断连 | **Cordis**：插件挂载到 `ctx`（`ctx.tools`/`ctx.llm`/`ctx.sessions`…），`inject` 声明依赖，typed events 协作，**reversible effects**（卸载即清理 listener/tool/prompt，不残留） | 高。连"可被无关应用复用"都一样（Chord 自称 not a Pi package；Cordis 是独立 meta-framework，有论文） |
-| 2 | 会话即 append-only 日志 | 不可变 entry 树 + `scanBranch` 投影；compaction 是自包含检查点 | append-only `SessionEvent` 日志是唯一真相源；`deriveMessages()` 从日志派生模型历史；resume/fork/replay/search 全消费同一事件流 | 高。dsh 的不变量"凡展示给模型的一定能从日志重建" ≈ pi 的三存储不变式 + 上下文投影规则（§4.10） |
-| 3 | 接口与驱动分离 | `Agent`（稳定）vs `AgentHarness`（持久化，新内核） | `agent`（`Agent` 接口 + live registry，`ctx.agents`）vs `agent-loop`（默认驱动）；扩展只依赖 `agent`、永不直连 `agent-loop`，loop 保持可换 | 中高。形状一致，但性质不同：pi 是**迁移期双轨**（新内核尚未替换稳定路径），dsh 是**原生 seam**（可换 loop 是设计起点） |
-| 4 | 执行拦截点 | 11 个 hooks（三类持久性；`before_drive`/`before_tool` fail-closed） | waterfall 事件（`agent/pre-step`、`agent/request`、`tools/*` 必须调 `next()` 才放行；`agent/turn-stopping` 串行截停） | 中。都是"请求/工具/turn 三处设卡"，但 pi 的 hook 语义绑定**持久性**（输出是否随事务落盘），dsh 的 waterfall 绑定**放行权**（调不调 `next()`） |
-| 5 | 外部效果安全 | 意图 → 不确定效果 → 结算；每调用声明 `replay: safe \| never`，`never` 永不重放 | guarded tool pipeline + 审批策略 + sandbox/execution provider seam（把 fs/subprocess 指向远端 sandbox，Bash/PTY/LSP 整体搬走，无需 fork provider） | 中。同一焦虑、两种解法：pi 把"崩溃后重不重放"写进每个调用的持久化契约；dsh 把"能不能执行"交给策略与执行环境隔离 |
-| 6 | 产品组装 | Pi Packages（扩展/skill/主题打包分发）+ facet bundle（esbuild/CJS/manifest/SHA-256/`node:vm` 加载） | profiles = 有序 bundle 栈 + patches（bundle 是贡献配置补丁的 npm 包；`dsh-base` + `web/headless/sdk/acp`；`dsh config` 可看最终合成树） | 中高。都是"有序叠加 + 覆盖"，dsh 的"可见的最终合成树"值得 pi 学（facet 组合目前没有等价的可视化） |
-
-### 9.3 本质差异：两边各自回答了对方没答的问题
-
-1. **崩溃恢复的完备性**：pi 的 AgentHarness 把"任意两事务之间杀进程都能续跑且不重放已结算效果"做成了可枚举的工程系统（13 leaf 总态重启点、accept/drive 分离、单写者 Drive、effect gate 同步准入）。dsh 的持久化叙事停在"日志 + projections + inbox 持久化变异"层面——resume/fork 有，**逐调用的 crash-replay 契约没有**。这是 pi2 全仓库最硬核、dsh 文档里找不到对应物的部分。
-2. **事件的地位相反**：dsh 的 typed events 是**一等协调机制**（waterfall 驱动放行、并行、顺序决策）；pi 的 harness events 明确是**被动观察**（§4.9"永不驱动执行"）。Chord 甚至没有 event bus。两边若互借，dsh 该借 pi 的"事件不驱动"纪律（避免观察者偷偷变成驱动者），pi 该借 dsh 的"可逆注册"纪律（对应 §4.13 H1 契约债里 listener/timer 残留类问题）。
-3. **可扩展类型系统的 Zel**：dsh 用 declaration merging 让插件给 `SessionEventMap` 加变体（拥有包零修改）；pi 用 bound typed address + 无全局注册表达到同样"应用扩展无需改核心"，但靠的是地址命名空间纪律而非类型合并。前者对 TS 生态更顺手，后者对多语言/远端边界更友好（地址可编码、不依赖 TS 特性）。
-4. **成熟度与姿态**：pi 是"稳定 CLI（经典 Agent）+ 实验性影子内核"双轨，保守演进；dsh 是 developer preview，一切皆可换但一切皆可变（官方明示 breaking changes）。一个求稳、一个求变，读文档时要代入各自的阶段。
-
-### 9.4 pi 可从 dsh 借的三件事（具体）
-
-1. **`dsh config` 式最终合成树可视化**：facet/bundle 叠加后"实际生效的是什么"今天只能靠读代码，dsh 把它做成了一等命令。§6 的 facet 排查成本会大降。
-2. **reversible effects 作为扩展 API 契约**：pi 的扩展卸载/热替换（`worker.ts` 的 retired dispose）今天靠人工写对清理；Cordis 把"注册即附带撤销"做进框架，可直接对标 Chord 的 `own()` 机制补齐。
-3. **projection seam 的增量折叠**：dsh 的 `dsh-session-projection`（对已提交事件增量 fold，`stateOf()`/`snapshot()` 读类型化状态）与 pi 的 `reduceLaneSnapshot` 是同构思想，但 dsh 把它做成了**注册表 + 多消费者共享**，pi 的 reducer 目前是客户端各自调用——多 presentation 场景下 dsh 的形态更省。
-
----
-
-## 10. 可借鉴的设计模式
+## 11. 可借鉴的设计模式
 
 1. **三存储不变式**：把"什么能存在哪里"约束成一条规则，并发、恢复、清理、分叉全部可推导。比"每个功能自己决定存哪"健壮得多。
 2. **接受与执行分离**：`accept` 落盘、`drive` 执行。这让 harness 不依赖任何调度器，服务端可用 alarm/job/HTTP 重入。
@@ -710,13 +1350,17 @@ Chord 的 API 形状直接解释了 §6.5 的关键约束"presentation facet 永
 5. **意图 → 效果 → 结算**：把"不确定窗口"显式建模，并给每个效果声明 `replay: safe | never`。这是 agent 系统里最容易被忽略、后果最严重的一环。
 6. **同步准入边界**：`gate.admit` 的检查与调用必须是同一个同步表达式，准备必须前置。这个约束很小但很关键。
 7. **事件是被动观察，不是驱动源**：`reduceLaneSnapshot` 作为唯一规范折叠函数，避免客户端各自实现第二套状态机。
-8. **稳定的窄接口 + 显式非目标**：文档里专门有一节 Non-goals。写清楚"不做什么"比写清楚"做什么"更能约束实现不腐化。
-9. **诚实的实现状态清单**：§0.9 逐条列出未实现项与契约债。这在真实工程里极其少见，也极其有用。
-10. **双轨演进**：新内核（AgentHarness）先在 experimental 与独立包中成型，用 `mini` 这类最小真实客户端压测，再谈替换稳定路径。
+8. **先验证后绑定**：所有 facet 同步声明形状 → 一次性校验完整依赖图 → provider 先激活 → 逆序 dispose。让依赖错误在启动期暴露，而不是运行期。
+9. **能力边界靠 API 形状，不靠约定**：`setup(env)` 的参数表就是权限清单。**这是本报告认为 Chord 最值得学的一点**——它把"插件不该拿到什么"从文档要求变成了类型约束。
+10. **拆掉依赖方，而不是代理换实现**：`use(Token)` 构造期返回值 + 依赖方随 provider 一起销毁，比"访问期守卫 + 缓存引用"更容易推理。
+11. **稳定的窄接口 + 显式非目标**：文档里专门有一节 Non-goals。写清楚"不做什么"比写清楚"做什么"更能约束实现不腐化。
+12. **诚实的实现状态清单**：`harness.md` §0.9 逐条列出未实现项与契约债。这在真实工程里极其少见，也极其有用。
+13. **双轨演进**：新内核（AgentHarness）先在 experimental 与独立包中成型，用 `mini` 这类最小真实客户端压测，再谈替换稳定路径。
+14. **通用设施零内部依赖**：`chord` 不依赖任何 Pi 包——这既是它可复用的前提，也是它不变质的保险（它无法偷偷去懂 Harness）。
 
 ---
 
-## 11. 风险与未完成项
+## 12. 风险与未完成项
 
 | 风险 | 说明 | 影响 |
 |---|---|---|
@@ -727,12 +1371,14 @@ Chord 的 API 形状直接解释了 §6.5 的关键约束"presentation facet 永
 | 双轨并存 | 稳定 CLI 与 harness 内核不同源 | 概念混淆、文档分裂、迁移成本 |
 | frame 持久化成本 | 每帧一次 durable append + 复制写 | 长输出场景 IO 放大；`mobile-handoff` 文档已在设计替代方案 |
 | 无内建权限系统 | 默认以启动用户权限运行 | 需依赖容器化/扩展；README 已明示 |
+| Chord 规格超前实现 | `ServiceMode` 的 `peer`、symmetric RPC peers 等只在 `facets.md` 出现，`types.ts` 尚未落地 | 读文档时需区分"设计"与"已实现" |
+| Chord 组合可视化缺失 | facet/bundle 叠加后实际生效的组合不可见 | 排查成本高（§9.5 建议借 `dsh config`） |
 
 ---
 
-## 12. 附录：关键文件索引
+## 13. 附录：关键文件索引
 
-### 规格与设计文档
+### 13.1 规格与设计文档
 
 | 路径 | 内容 |
 |---|---|
@@ -741,15 +1387,19 @@ Chord 的 API 形状直接解释了 §6.5 的关键约束"presentation facet 永
 | `packages/agent/docs/tool-durability.md` | 工具持久性（704 行） |
 | `packages/agent/docs/assistant-durability.md` | assistant 输出持久性（355 行） |
 | `packages/agent/docs/runtime-simplification.md` | 运行时简化（391 行） |
-| `packages/agent/docs/plugins.md` | coding-agent facet/service 架构（1158 行） |
+| `packages/agent/docs/plugins.md` | coding-agent facet/service 架构（1158 行，已被 facets.md 取代） |
+| `packages/agent/docs/mobile-handoff/02-plugins/01-facets/facets.md` | **更新的 facet/service 规格（1855 行）；§13.1–13.2 是对 Cordis / DSH 的一手对照与批评** |
 | `packages/agent/docs/rpc.md` | facet service RPC 语义 |
 | `packages/agent/docs/pico-v3.md` | 下一代 harness 设计（2113 行，讨论中） |
 | `packages/agent/docs/pico/pico-usage-guide.md` | pico 使用指南（1497 行） |
 | `packages/agent/docs/work-packages/00–09` | WP 工作包（runtime1 移除 → lane snapshot settled tools） |
 | `packages/coding-agent/docs/` | 34 篇用户/开发者文档（extensions 3033 行、rpc 1618 行、sdk 1226 行…） |
+| `packages/chord/README.md` | **Chord 设计总览（205 行）：六件套、remote adapter、delta、bundling** |
+| `packages/chord/PLANNING.md` | Chord RPC / generation-loading 规划 |
+| `packages/chord/src/delta/README.md` | delta 变更、数组、生命周期与消费者所有权规则 |
 | `AGENTS.md` / `CONTRIBUTING.md` / `SECURITY.md` | 项目规则 |
 
-### 核心源码
+### 13.2 核心源码
 
 | 路径 | 行数 | 内容 |
 |---|---|---|
@@ -768,18 +1418,17 @@ Chord 的 API 形状直接解释了 §6.5 的关键约束"presentation facet 永
 | `packages/coding-agent/src/core/session-manager.ts` | — | JSONL v3 会话管理 |
 | `packages/coding-agent/src/experimental/session-worker.ts` | 884 | 实验性 session worker |
 | `packages/coding-agent/src/experimental/mini/` | — | 最小分布式 harness（server/worker/tui） |
-| `packages/chord/src/services/` | ~1900 | service consumer/provider/handle/state-codec/wire（原"—"细化） |
-| `packages/chord/README.md` / `PLANNING.md` | 205 行 / — | Chord 设计总览与 RPC/generation-loading 规划（§7） |
-| `packages/chord/src/types.ts` | — | `Facet` / `FacetEnvironment` / `Service` / wire 类型全集 |
-| `packages/chord/src/api.ts` | 90 | `createFacetHost` / `defineFacet` / `defineService` / `replicatedState` |
+| `packages/coding-agent/src/experimental/services/worker.ts` | — | **标准组装模板**：builtins + 插件 facets → `createFacetHost` → 候选 reload（§7.9） |
+| `packages/chord/src/types.ts` | — | `Facet` / `FacetEnvironment` / `Service` / `ServiceMode` / wire 类型全集 |
+| `packages/chord/src/api.ts` | 90 | `createFacetHost` / `defineFacet` / `defineService` / `replicatedState` / `createRemoteServiceBinding`；`$chord.` 保留前缀检查 |
 | `packages/chord/src/facets/host.ts` | 906 | FacetKernel：setup/激活/依赖图校验/reload/dispose |
+| `packages/chord/src/services/` | ~1900 | service consumer/provider/handle/state-codec/wire（`$chord.service` 控制通道） |
 | `packages/chord/src/delta/index.ts` | 1267 | 独立 delta 原语（`track`/`apply`，base batch + 路径操作） |
 | `packages/chord/src/node/` + `bundler.ts` | — | facet 打包（esbuild/CJS/manifest）与 Node 加载（SHA-256 + `node:vm`） |
-| `packages/coding-agent/src/experimental/services/worker.ts` | — | 标准组装模板：builtins + 插件 facets → `createFacetHost` → 候选 reload |
 | `packages/protocol/src/` | — | codec / framing / protocol + cbor |
 | `packages/server/src/session-router.ts` | — | Session 路由与附件 |
 | `packages/session-backends/sqlite-node/src/` | — | node:sqlite 后端 |
 
 ---
 
-*本报告基于本地源码静态阅读完成，未运行构建或测试。规范类结论以 `packages/agent/docs/harness.md` 为准；行为类结论以源码为准；两者冲突处已在正文标注（如 §0.9 列出的契约债）。*
+*本报告基于本地源码静态阅读完成，未运行构建或测试。规范类结论以 `packages/agent/docs/harness.md` 与 `packages/chord/README.md` 为准；行为类结论以源码为准；两者冲突处已在正文标注（如 §4.13 列出的契约债、§7.4 的 `peer` 规格落差）。§9 的 dsh / Cordis 结论区分了一手证据（pi 仓库内的直接对照）与二手证据（公开资料），并明确标注了证据等级。*
