@@ -115,8 +115,8 @@ DeepSeek → Cordis / Everything is Plugin
 |---|---|
 | **prompt** | 笼统地指"交给模型的那段内容"。**它不是一个字符串**，而是由好几条消息拼出来的（系统说明 + 历史 + 工具结果……）。本报告在没有特别说明时，"prompt" 就泛指这份输入里"文字性"的那部分 |
 | **system prompt** | 消息列表最前面那段"系统角色说明"：你是谁、规则是什么、怎么干活 |
-| **messages** | 真正发给 provider 的消息数组，每条带一个角色（system / user / assistant / tool） |
-| **Model Request Construction / 模型请求构造** | 本报告的总称：把"Agent 当前状态"变成"一次 provider 请求"的完整过程。分成四步（§4.1） |
+| **messages** | 真正发给模型 provider 的消息数组，每条带一个角色（system / user / assistant / tool） |
+| **Model Request Construction / 模型请求构造** | 本报告的总称：把"Agent 当前状态"变成"一次模型 provider 请求"的完整过程。分成四步（§4.1） |
 | **Prompt Assembly** | 常被笼统用来指"把信息组装成模型能读的输入"。**它不等于全部**——在 pi 里，完整过程还包含请求装配、provider 编码、效果执行三步。本报告凡是要精确时，一律用"模型请求构造" |
 | **prompt template** | 可复用的提示词模板，展开后当成一条用户消息发出去（比如斜杠命令） |
 | **Harness** | 包在模型外面、负责"把活干完"的那层程序：管历史、管状态、管工具、管崩溃恢复 |
@@ -130,6 +130,10 @@ DeepSeek → Cordis / Everything is Plugin
 | **13 个平铺状态** | pi 文档原话是 `flat 13-leaf union`，指 `state.at` 只能取 13 个值之一，彼此不嵌套。**"leaf（叶子）"是 pi 作者借树结构造的词，不是业界标准术语**；TypeScript 里的正式说法是"联合类型的成员"。详见 §4.8 |
 | **facet** | 一个插件在某个运行环境里的那一部分（同一个插件可以有多个 facet） |
 | **service** | facet 对外提供的能力，用"带类型的名字"（token）而不是对象引用来引用 |
+| **provider**（两个意思，最容易混） | ① 讲模型时：**模型厂商**（OpenAI / Anthropic……）。② 讲 Chord / 依赖注入时：**提供某个 service 的那一方**，和 consumer 相对。**怎么区分**：看上下文——提到 messages / token / KV cache 就是 ①；提到 service / 绑定 / 依赖图 / 替换就是 ② |
+| **consumer** | 和上面第 ② 个意思相对：**使用某个 service 的那一方** |
+| **checkpoint** | 检查点。工具跑到一半时，把当前进度写进持久存储的那一次动作（§4.7） |
+| **stub** | 桩。一个"接口在、实现故意不写"的占位实现——调用它会直接抛"未实现"（§4.10 的 R12） |
 | **replicated state** | 会实时同步到别的进程/界面的状态（比如进度条） |
 | **pass** | 一次"从开始推进到结束"的进程内过程 |
 | **effect** | 会对外部世界产生实际影响的操作（调模型、真正执行工具、写文件） |
@@ -152,7 +156,7 @@ DeepSeek → Cordis / Everything is Plugin
 | **契约** | 双方约定的"长什么样、能做什么"。在本报告里通常指**类型层面的约定**，由编译器而不是由人来检查 |
 | **状态机** | 一个对象只能处在有限几个状态之一，并且只能按规定的路径从一个状态走到另一个 |
 | **投影（projection）** | 从一份完整的原始数据里，挑出这次需要的那部分并重新组织。本报告在讲 §4.1 的**第 ① 步**时固定用"投影" |
-| **提升（lift）** | A/B 实验里的常规说法：**实验组 − 对照组**。本报告里特指 §5.8 的"文档提升"——同一个 case，能读文档 vs 读不到文档，两边通过率之差（单位 pp，百分点） |
+| **提升（lift）** | A/B 实验里的常规说法：**实验组 − 对照组**。本报告里特指 §5.8 的"文档提升"——同一道题，能读文档 vs 读不到文档，两边通过率之差（单位 pp，百分点） |
 
 后面出现这些词时，会尽量在第一次用到的地方再用大白话解释一遍。
 
@@ -404,7 +408,7 @@ packages/ai/src/
 
 ### 4.1 从 Session 到 Model Input
 
-先看这条链的**全程**。Pi 的每一次 provider 请求，都是从同一份持久事实里挑出来、重新整理出来的——而且是**四步**：
+先看这条链的**全程**。Pi 的每一次模型 provider 请求，都是从同一份持久事实里挑出来、重新整理出来的——而且是**四步**：
 
 ```
 Session（不可变 entry 树 + bound values/lists + ledger）
@@ -466,15 +470,15 @@ Session（不可变 entry 树 + bound values/lists + ledger）
 
 > **Pi 并没有把 Session 当成 Prompt。**
 >
-> **Session 是"已经发生的事实"；Model Input 则是根据当前 lane 和 provider 的需要，从这些事实里挑出来、重新整理出来的结果。**
+> **Session 是"已经发生的事实"；Model Input 则是根据当前 lane 和模型 provider 的需要，从这些事实里挑出来、重新整理出来的结果。**
 
 这个区分是整个设计的支点：
 
 - **Session 是已经发生的事实（durable truth）** —— 只追加、永不删除、跨崩溃仍然正确；
 - **Context 是每次现算的（projection，投影）** —— 每次请求重新算一遍，有大小上限，可以随时丢掉；
-- **Prompt 只是其中一部分** —— 真正发给 provider 的 messages，只是这次整理出来的产物之一。
+- **Prompt 只是其中一部分** —— 真正发给模型 provider 的 messages，只是这次整理出来的产物之一。
 
-**注意一个容易搞错的细节**：一次 provider 请求实际上是三块东西，来源并不相同（源码见 `agent-loop.ts:296`、`harness/runtime/drive/generation.ts:103`）：
+**注意一个容易搞错的细节**：一次模型 provider 请求实际上是三块东西，来源并不相同（源码见 `agent-loop.ts:296`、`harness/runtime/drive/generation.ts:103`）：
 
 ```
 Model Input
@@ -588,7 +592,7 @@ await session.appendList(events, event, context);
 
 **扩展点**：阶段 ① 里只有 `entryProjectors` 一个（决定 custom entry 怎么进上下文）；阶段 ②③ 里是 §4.7 的那些 hooks。**阶段 ① 的算法本身不可替换**——这是 Pi 的选择：整理路径固定下来，可靠性才有可能被证明。
 
-**只追加的上下文铁律（append-only context invariant）**：同一个 lane 的多次请求，发给 provider 的上下文只允许在末尾往后加——如果在上一请求的末尾之前插入内容，会让 provider 已经算好的 KV cache 全部作废（KV cache：模型对已经读过的前缀的缓存），成本成倍上升。所以运行过程中产生的内容一律推迟到 checkpoint，追加到末尾。**compaction 是唯一一处故意让 cache 失效的地方。**
+**只追加的上下文铁律（append-only context invariant）**：同一个 lane 的多次请求，发给模型 provider 的上下文只允许在末尾往后加——如果在上一请求的末尾之前插入内容，会让模型 provider 已经算好的 KV cache 全部作废（KV cache：模型对已经读过的前缀的缓存），成本成倍上升。所以运行过程中产生的内容一律推迟到 **checkpoint（检查点）**，追加到末尾。**compaction 是唯一一处故意让 cache 失效的地方。**
 
 这条铁律直接限制了上下文的整理：**你不能"想加什么就加什么"**，只能往末尾追加。它让"插件能怎么改上下文"这个问题的答案，收窄成了一个非常保守的集合。
 
@@ -652,7 +656,7 @@ await session.appendList(events, event, context);
 | `operationState` / 13 个平铺状态 | 本轮跑到哪一步了 | 它是"运行状态"，不是"发生过的事实"；每次转移被整份覆盖，且从不写进 entry |
 | `usage ledger`（用量账本） | 花了多少 token、多少钱 | 只用于计费和统计，永不进上下文 |
 | `branchTip` / `laneConfig` / `laneState` | 下一条追加到哪、lane 怎么配、inbox 里有什么 | 这些是调度信息，不是对话内容 |
-| `pendingEntry` / `pendingToolOutput` / `pendingAssistantFrames` | 已落盘但还没归位的中间态 | 只是临时存放，归位之后就删掉 |
+| `pendingEntry` / `pendingToolOutput` / `pendingAssistantFrames` | 已经写进存储、但还没被合并到正式位置的中间状态 | 只是临时存放，一旦合并完就删掉 |
 | Drive / pass / `gate.admit` | 谁在推进、什么时候才允许真正去调外部 | 纯执行机制 |
 | 单写者规则 / 写入串行线 / 数据库事务（`BEGIN IMMEDIATE`） | 并发写入怎么不打架 | 存储层机制 |
 | `replay: safe / never` | 崩了以后哪些能重跑 | 只决定"要不要重跑"，模型只看到最终结果 |
@@ -704,7 +708,7 @@ hook 本身是程序内部的钩子，模型看不到。只有被分到 `transit
 
 > **Pi 的绝大部分代码，是在保证"程序内部的状态是对的"，而不是在"写 prompt"。**
 >
-> 模型最终看到的，只是这条链沉淀下来的少数几类内容（表 B）；表 A 里的东西全是脚手架——它们不产生内容，只保证表 B 里的内容正确、完整、顺序确定。
+> 模型最终看到的，只是这条链最后留下来的少数几类内容（表 B）；表 A 里的东西全是脚手架——它们不产生内容，只保证表 B 里的内容正确、完整、顺序确定。
 
 这也正好回答了阅读指引里那个说法：**把 Harness 叫成"Prompt 拼装器"太窄了**——拼装只是它最后一步的可见产物，前面那一整套（状态机、崩溃恢复、效果准入、并发写入、插件边界）都发生在模型视野之外。
 
@@ -828,7 +832,7 @@ outcome_ready
 - **工具完成的先后 ≠ 它们写进树里的先后**。并行跑的工具按完成顺序暂存，但写进树时按 assistant 给出的先后顺序——这既保证了"下一轮模型看到的消息顺序是确定的"，也保证了"崩溃后已完成的结果不会被重放"。
 - **checkpoint 由工具自己控制**节奏、去重与大小上界；API 不设通用的字节上限。bash 的实践值：实时更新 100ms、checkpoint 最多每 2s 一次且仅在内容变化时、单次 50KiB。
 - **`terminate: true`** 让工具直接结束这一轮 run，不用再来一次 provider 调用——这是"用结构化输出替代一轮对话"的实现方式。
-- **invocation memo**（`getMemo`/`setMemo`）是"单次工具调用"范围内的持久键值存储，用于 Flue 风格的命名结果记忆；把结果写进树时会连同这次调用一起删掉。
+- **invocation memo**（`getMemo`/`setMemo`）是"单次工具调用"范围内的持久键值存储，用来给这次调用起的名字存结果（文档里称 Flue 风格的命名结果记忆）；把结果写进会话树时，会连同这次调用一起删掉。
 
 **Assistant 输出的持久性**：`assistant.ready` / `assistant.effect_pending` / `assistant.retry_wait` 三个状态 + `pendingAssistantFrames` 这个有上限的列表。流式帧被编码成紧凑的恢复帧后追加到该列表；harness 只负责追加，**不重复实现编解码器**（`harness.md` §0.7 明确"harness 不定义第二个 frame codec"）。
 
@@ -988,7 +992,7 @@ SQLite 的两个不那么显然的点：
 |---|---|---|
 | J1 | JSONL 快照压缩 | 已写进规范，**未实现**（被弃用的字节永不回收） |
 | C1 | raw RemoteSession | 规范与已发布产品矛盾，**需决策** |
-| R12 | `watchSession` | 抛 `SliceNotImplemented`，唯一的 stub |
+| R12 | `watchSession` | 抛 `SliceNotImplemented`，全文唯一的桩（stub） |
 | T1 | telemetry | 只启动 tool-hook span；RPC 无 trace 传播 |
 | S3 | search | 只有设计，`src/search/index.ts` 骨架与设计冲突 |
 | R11 | schema migration | 机制已定，activation-gated，无实际迁移 |
@@ -1118,26 +1122,26 @@ export default function (pi: ExtensionAPI) {
 - **Pi Packages**：把扩展/skill/提示词/主题打包，经 npm 或 git 分发（`pi install npm:@foo/bar@1.0.0`）。
 - **Themes**：内置 + 自定义终端主题。
 
-### 5.8 Evals
+### 5.8 Evals（行为级评测）
 
 `packages/evals`（`@earendil-works/pi-evals`）用 `vitest-evals` 做**行为级**评测，而不是单元测试。它现在分成两条明确不同的路径：
 
 | 路径 | 文件约定 | 怎么跑 | 是什么 |
 |---|---|---|---|
-| **Host evals** | `evals/*.eval.ts`（除 `*.docs.eval.ts`） | `eval:host` = `vitest run --config vitest.evals.config.ts --project host` | 普通的 vitest-evals 套件，在**本机**跑，不做成对比较 |
-| **Documentation-lift evals** | `evals/*.docs.eval.ts` | `eval:docs` = `node --experimental-strip-types src/cli.ts` | 成对实验：同一个 case 在 `without_docs` / `with_docs` 两个隔离容器里各跑一遍，比较"文档在不在模型视野里"带来的差异（下节详述） |
+| **Host evals**<br>（跑在本机上的普通套件） | `evals/*.eval.ts`（除 `*.docs.eval.ts`） | `eval:host` = `vitest run --config vitest.evals.config.ts --project host` | 普通的 vitest-evals 套件，在**本机**直接跑，不做两两对比 |
+| **Documentation-lift evals**<br>（文档提升对比） | `evals/*.docs.eval.ts` | `eval:docs` = `node --experimental-strip-types src/cli.ts` | 成对实验：同一道题在 `without_docs` / `with_docs` 两个隔离容器里各跑一遍，比较"文档在不在模型视野里"带来的差异（下节详述） |
 
 `npm run eval` = `eval:host` + `eval:docs` 两段依次跑。
 
-`src/` 是 runner 代码，职责切得很干净：
+`src/` 是 runner 代码（"runner" = 负责把评测跑起来的那套调度代码），职责切得很干净：
 
 - `cli.ts` — 编排一次比较；
-- `docker.ts` — 构建两个镜像、发现 case、跑其中一条隔离臂；
-- `plan.ts` — 把 case 展开成 `(case, variant, repetition)` 任务；
-- `report.ts` — 读 Vitest JSON、配对两条臂、算 lift；
+- `docker.ts` — 构建两个镜像、发现题目、跑其中一遍（一次只跑一个容器）；
+- `plan.ts` — 把每一道题展开成"题目 × 变体 × 第几次重复"的任务清单；
+- `report.ts` — 读 Vitest 的 JSON 输出、把"对照组/实验组"的两次运行配对、算 lift；
 - `harness.ts` — vitest-evals 适配器。
 
-评测套件与 fixture 在 `evals/` 下；镜像构建文件在 `docker/` 下。
+评测套件与配套数据（fixture）在 `evals/` 下；镜像构建文件在 `docker/` 下。
 
 ```bash
 # host evals + 文档比较（需要 PI_PROVIDER / PI_MODEL）
@@ -1148,7 +1152,7 @@ npm run eval:host -w packages/evals
 npm run eval:host -w packages/evals -- evals/documentation-audit.eval.ts
 ```
 
-默认每个 variant 跑一次；要衡量稳定性需显式提高重复次数（`--runs-per-variant 5` 或 `PI_EVAL_RUNS_PER_VARIANT=5`）。Vitest 的 `-t` 过滤器在**发现阶段**就生效。
+默认每种变体（`with_docs` / `without_docs`）只跑一次；要衡量稳定性必须显式提高重复次数（`--runs-per-variant 5` 或 `PI_EVAL_RUNS_PER_VARIANT=5`）。Vitest 的 `-t` 过滤器在**发现阶段**就生效。
 
 #### 什么叫"文档带来的提升（docs lift）"
 
@@ -1167,11 +1171,13 @@ pi 的核心主张之一是"模型能看到什么，是程序算出来的"。文
 
 **两个变体到底差在哪（这是关键）**
 
+（"变体" = 同一套东西的两个版本，这里就是 `without_docs` 和 `with_docs`。实验设计里通常把前者叫**对照组**、后者叫**实验组**。）
+
 | | `without_docs`（对照组） | `with_docs`（实验组） |
 |---|---|---|
 | 文件 | 删掉 coding-agent 的 `README.md` / `CHANGELOG.md` / `docs/` / `examples/` | 保留 |
 | system prompt | **同时**删掉默认 prompt 里"Pi 文档在哪"那一段（documentation-routing section） | 原样不动 |
-| 其余一切 | 同一份 workspace tarball、同一套 npm overrides、同样的工具白名单、同一个模型、同一道题 | 相同 |
+| 其余一切 | 同一份工作区打包产物、同一套 npm 依赖覆盖规则、同样的工具白名单、同一个模型、同一道题 | 相同 |
 
 所以严格说，被操纵的自变量是**一整包"文档可见性"**（文件 + 那一小段 system prompt），而不是单独某一样。
 
@@ -1183,7 +1189,7 @@ pi 的核心主张之一是"模型能看到什么，是程序算出来的"。文
 lift = with_docs 的通过率 − without_docs 的通过率        （单位：pp，百分点）
 ```
 
-（"通过率" = 该组里判分 `score ≥ 1` 的 arm 占该组全部 arm 的比例；`score` 由 vitest-evals 的 judge 给出。源码 `report.ts` 里就是 `lift: difference(treatmentPassRate, controlPassRate)`。）
+（"通过率" = 这一组里**判分拿到满分**的次数 ÷ 这一组的总运行次数。源码 `report.ts` 里就是 `lift: difference(treatmentPassRate, controlPassRate)`。）
 
 报告里长这样：
 
@@ -1192,19 +1198,19 @@ Pass rate  +21.5 pp (with 78.0%, without 56.5%)
 Est. cost  +$0.0312 (with $0.0841, without $0.0529, 12 pairs)
 ```
 
-除了通过率，还会算 token 数 / 工具调用次数 / 耗时 / 估算成本的**平均差**（`meanDelta`）——因为"文档让它做对了"和"文档让它多花了一倍钱"是两件事，都要看见。
+除了通过率，还会算 token 数 / 工具调用次数 / 耗时 / 估算成本的**平均差**（`meanDelta`）——因为"文档让它做对了"和"文档让它多花了一倍钱"是两件事，都要看见。（上面样例里的 `pairs` = 成功配成对的运行组数，见下一段。）
 
 **为什么必须"成对"**
 
-每个 `(case, variant, model, runNumber)` 是一条 arm，跑在一个全新的容器里（新的 home、agent 目录、workspace、session 目录、容器文件系统；eval 定义与配置在降权到非特权 UID 后不可读；内部依赖包的文档也**对称删除**，防止它们变成"另一份说明书"）。
+每个 `(case, variant, model, runNumber)` 组合是**一次独立的运行**（源码和 README 里管它叫一个 *arm*，直译是"实验的一条分支"，就是这个意思），跑在一个全新的容器里——新的 home 目录、agent 目录、工作区、session 目录、容器文件系统；评测定义和配置由 root 拥有，程序降权成普通用户身份运行后就再也读不到它们；内部依赖包自带的文档也会**对称删除**，防止它们变成"另一份说明书"。
 
-只有当同一道题的对照组和实验组**各自恰好产出一个分数**时，这一对才算数（eligible pair）。缺一条、重复、skipped / pending / unscored / errored——这一对就被 blocked。
+只有当同一道题的"对照组"和"实验组"**各自恰好产出一个分数**时，这两次运行才配成一对、算数。缺一条、重复、跑挂了的（skipped / pending / unscored / errored）——这一对就作废。
 
-**只要有一对被 blocked，整组的 headline 通过率就不公布**，进程以非零码退出。这是刻意的：宁可不说，也不给一个可能误导的平均数。缺失的 telemetry 同样保持"不可用"，而不是当成 0。
+**只要有一对作废，这一组的总通过率就不公布**，进程以非零码退出。这是刻意的：宁可不说，也不给一个可能误导的平均数。缺失的用量数据（token / 成本）同样保持"不可用"，而不是当成 0。
 
 **报告会主动标出"这几种结果没意义"**
 
-| flag | 含义 |
+| 报告打的标记 | 含义 |
 |---|---|
 | `no-lift` | 两边一样 → 文档没起作用 |
 | `negative-delta` | 给了文档反而更差 |
@@ -1217,7 +1223,7 @@ Est. cost  +$0.0312 (with $0.0841, without $0.0529, 12 pairs)
 
 `evals/extensions.docs.eval.ts` 的题目是：
 
-> "给这个正在运行的 Pi 装一个扩展，里面有个 hello 工具，传 Bob 返回 `Hello, Bob!`。"（然后 reload，再让模型用这个工具问候 Bob。）
+> "给这个正在运行的 Pi 装一个扩展，里面有个 hello 工具，传 Bob 返回 `Hello, Bob!`。"（装好之后重启一次扩展，再让模型用这个工具问候 Bob。）
 
 判分同时看四件事：最终回复内容、扩展加载有没有报错、hello 工具是否真的被注册、工具调用返回了什么。
 
@@ -1391,7 +1397,7 @@ generation ──────────┼─ tool B ─┼─ post_tools ─ 
 
 Scheduler 只懂 task 生命周期、依赖、时序、取消；不懂 prompt、工具参数、摘要。Storage 只懂存储对象与原子变更，不懂 task 行为。这与当前 `harness.md` 的"直接 async 过程 + 13 个平铺状态"形成对照——**pico 是"从状态机走向可替换任务图"的演进路线**。文档明确标注为"Design under discussion"。
 
-### 6.8 收束：Agent Harness 的本质，是构造下一次 Model Input
+### 6.8 归结：Agent Harness 的本质，是构造下一次 Model Input
 
 把 §6 的所有问题再往上抽一层。Agent 的工作永远是同一个循环：
 
@@ -1501,6 +1507,8 @@ Chord 有两个核心问题：
 所以更完整的定义是：
 
 > **Chord 不只是一个 application composition runtime，它同时是一个 capability boundary runtime。**
+>
+> （说人话：**Chord 不只负责"把应用组装起来"，它同时负责"划出能力边界"。**）
 
 这两句话里，**第二句才是本报告认为最有价值的观察**。大多数"插件系统"只认真解决第 1 问——让插件能挂上去；至于挂上去之后插件能伸手拿到什么，通常靠文档约定和代码评审。Chord 把第 2 问做进了 API 形状（§7.3 的 `setup(env)`、§8.4）。第 1 问是它和 Cordis 相似的地方，第 2 问是它和 Cordis 分道的地方。
 
@@ -1508,7 +1516,7 @@ Chord 有两个核心问题：
 
 身份特征（均有源码实证）：
 
-- **零 Pi 内依赖**：`packages/chord/package.json` 的 dependencies 无任何 `@earendil-works/*`；README 原话"it is not a Pi package … can be used by unrelated applications"。这也是它排在构建第一位的原因。
+- **不依赖任何 Pi 内部的包**：`packages/chord/package.json` 的 dependencies 里没有任何 `@earendil-works/*`；README 原话"it is not a Pi package … can be used by unrelated applications"。这也是它排在构建第一位的原因。
 - **保留命名空间**：Chord 自有标识用 `chord.*`，保留 service 前缀 `$chord.*`；`defineService()` 对 `$chord.` 开头的 id 直接抛错（`src/api.ts:80`：`Service IDs beginning with $chord. are reserved`）。
 - **分路径导出**：包根（tokens/hosts/state）、`/context`（`Context` 等通用名特意不污染根 API）、`/delta`（独立 delta 原语）、`/node`（仅 Node 的 bundle loader）、`/bundler`（esbuild 打包）。调用方按需 import，不是一锅端。
 - **体量**：`src/services/` + `delta` + `context` + `node/bundle` 约 3700 行，`facets/host.ts`（FacetKernel）906 行，10 个测试文件。不是小工具，是完整子系统。
@@ -1734,7 +1742,7 @@ const replica = apply({ output: "", count: 0 }, ops);
 
 回到 §2.2 主图：**Presentation 与 Worker 之间那条横线**，就是这道边界。它必须存在，否则 TUI 就又能直接碰 Harness 了。
 
-跨进程调用需要一套 wire 语法。Chord 的选择是**只定语法，不定传输**。
+跨进程调用需要一套"线上格式"（wire format，即跨进程传输时双方约定的语法）。Chord 的选择是**只定语法，不定传输**——它规定"说什么"，不管"怎么送过去"。
 
 Chord 拥有的（与具体传输方式无关）：
 
@@ -1935,7 +1943,7 @@ TUI                    server                 session worker S0              Har
 |---|---|---|
 | **核心铁律** | "数据只存在于 entry / bound value-list / ledger 三者之一" | "依赖图先验证后绑定，按相反顺序销毁" |
 | **时间尺度** | 跨崩溃仍然正确（秒 → 天） | 运行中组合与替换（毫秒 → 秒） |
-| **依赖方向** | 依赖 chord 的**基础原语**（运行时 import `Context` 一族 + 类型） | 零 Pi 内依赖 |
+| **依赖方向** | 依赖 chord 的**基础原语**（运行时 import `Context` 一族 + 类型） | 不依赖任何 Pi 内部的包 |
 
 第三行需要**说准确**——这里曾经容易被写错。看 `agent` 包对 chord 的实际引用（`packages/agent/src/harness/context.ts`）：
 
@@ -2084,7 +2092,7 @@ Chord
 
 关键判断（原文意思）：**代理不修复缓存引用问题，它只是把"不可能"变成"静默错误"。** 而"拆掉依赖方"之所以安全，正是因为**持有者会随提供者一起死**。
 
-pi 也没有把这条路堵死。`facets.md` 记录了一个**推迟的（deferred, not adopted）**方案：如果将来发现"拆掉依赖方"太粗，加的不是 OSGi 式的动态策略，而是 HMR（热模块替换）式的 `accept()`——一个**按依赖粒度**的选择加入：
+pi 也没有把这条路堵死。`facets.md` 记录了一个**推迟的（deferred, not adopted）**方案：如果将来发现"拆掉依赖方"太粗，加的不是 OSGi 式的动态策略，而是 HMR（热模块替换）式的 `accept()`——一个**按依赖的粗细来选**的加入机制：
 
 ```
 uses: [Harness, accepts(Models)]
@@ -2158,7 +2166,7 @@ Plugin ──(只能走)──► Service / State / Hook ──► 受控的构�
 
 这条链的终点——也就是"**到底什么东西最后会变成 prompt 文字**"——§4.4 有逐项清单。对照那份清单，插件真正能"写进模型视野"的入口可以归成三类，**而不是只有一条**：
 
-| 类别 | 具体入口 | 落点 |
+| 类别 | 具体入口 | 它最后落在哪一步 |
 |---|---|---|
 | **A. 写持久历史** | 追加 Session entry（消息、branch_summary、custom） | 下一轮 ① Context Projection 读出来 |
 | **B. 参与构造过程** | 注册 hook：`before_request`（可改 `streamOptions`）、`transform_context`（可改 messages / systemPrompt）、`before_payload` | ②③ 两个阶段内部 |
@@ -2235,7 +2243,7 @@ Pi 把解释权**收进内核**：四阶段写死，插件只能在预先规定�
 
 注意最后一行的对称性：两边的哲学**不是同一个命题的正反面，而是两个不同的首要关切**。Pi 先要"不会错"，再谈"能不能换"；dsh 先要"什么都能换"，再把可靠性当作插件组合的一个性质。
 
-#### Prompt 是 request field，还是 derived history？
+#### Prompt 到底是"请求字段"还是"派生历史"？
 
 上表"Prompt 是什么"那一行值得单独拎出来，因为它常被含糊带过。两边给出的答案是**结构性不同**的：
 
@@ -2260,9 +2268,9 @@ dsh 的 prompt 被提交成一个 `system/message` 表面节点，也就是说�
 
 **读法提醒**：这一条不是"谁更好"，而是**两种关于"prompt 到底是什么"的本体论选择**。把它和上面的"解释权"放在一起看，就能理解为什么两边的 `transform_context` / `system-prompt` 机制长得完全不同：它们对"prompt 是什么"的定义从根上就不一样。
 
-### 9.3 两张构造管线图
+### 9.3 两张构造流程图
 
-**Pi：固定的整理管线**
+**Pi：一条固定不变的构造链**
 
 ```
         Session（已发生的事实）        lane 配置 / harness options
@@ -2281,15 +2289,17 @@ dsh 的 prompt 被提交成一个 `system/message` 表面节点，也就是说�
 
 左边是从历史**整理**出来的，右边是每次**现算**的请求字段——两者都不落盘成历史。
 
-> **"谁允许改变这条 pipeline？"**
+> **"谁允许改变这条构造链？"**
 >
 > 答案是一个**封闭集合**：Harness 自己（算法固定）+ hooks（三类持久性，§4.7）+ `entryProjectors` + `transform_context` + service 提供的数据 + Chord 控制的贡献。
 >
-> 而且 §4.3 的**只追加上下文铁律（append-only context invariant）**给这条 pipeline 加了一道硬约束：**只能在尾部追加**。所以"改 prompt"在 Pi 这里从来不是"随便改字符串"。
+> 而且 §4.3 的**只追加上下文铁律（append-only context invariant）**给这条链加了一道硬约束：**只能在尾部追加**。所以"改 prompt"在 Pi 这里从来不是"随便改字符串"。
 >
 > **到底哪些东西会真的变成 prompt 文字、哪些只是程序内部的脚手架**，§4.4 给了一张完整清单。
 
-**DeepSeek：assembly 本身是一个 waterfall 事件**
+**DeepSeek：组装过程本身就是一个 waterfall 事件**
+
+（waterfall = "瀑布式"事件：调用一层层往下传，每一层都能看、能改，或者干脆短路掉后面的层。Cordis 用它来做可拦截的组装。）
 
 ```
                  Cordis Context
@@ -2560,7 +2570,7 @@ core instructions
 
 ---
 
-## 12. 收束：从 Execution / Composition 到四层模型
+## 12. 总结：从 Execution / Composition 到四层模型
 
 本报告开头把 Agent Harness 拆成 **execution**（保证状态不被崩溃/重试/副作用弄坏）与 **composition**（决定谁的能力与上下文能进来）两个问题。这个拆法**足够用来组织章节**，但它其实不是架构本身——它是**两个横切的关切**，会同时穿过下面每一层。
 
@@ -2681,7 +2691,7 @@ core instructions
 | `packages/chord/src/api.ts` | 90 | `createFacetHost` / `defineFacet` / `defineService` / `replicatedState` / `createRemoteServiceBinding`；`$chord.` 保留前缀检查 |
 | `packages/evals/src/harness.ts` | 498 | vitest-evals 适配器（host 与 docs 两条路径共用） |
 | `packages/evals/src/cli.ts` / `docker.ts` / `plan.ts` / `report.ts` | 192 / 175 / 59 / 481 | 文档提升对比的四段 runner：编排 → 隔离容器 → 任务展开 → lift 计算 |
-| `packages/evals/evals/*.docs.eval.ts` | — | 文档提升 case（custom-provider / documentation-audit / extensions / models / openai-provider） |
+| `packages/evals/evals/*.docs.eval.ts` | — | 文档提升的题目（custom-provider / documentation-audit / extensions / models / openai-provider） |
 | `packages/chord/src/facets/host.ts` | 906 | FacetKernel：setup/激活/依赖图校验/reload/dispose |
 | `packages/chord/src/services/` | ~1900 | service consumer/provider/handle/state-codec/wire（`$chord.service` 控制通道） |
 | `packages/chord/src/delta/index.ts` | 1267 | 独立 delta 原语（`track`/`apply`，base batch + 路径操作） |
