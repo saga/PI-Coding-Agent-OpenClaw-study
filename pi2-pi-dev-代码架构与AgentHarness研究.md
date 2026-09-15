@@ -33,7 +33,7 @@
 3. **接受（accept）与执行（drive）分离**。`accept` 只落盘一个 operation，不启动任何进程内工作；`drive` 才安装进程内的 pass。这使 harness 天然适配"无调度器的服务端"（alarm / job / HTTP 重入均可）。
 4. **"意图 → 不确定效果 → 结算"两段提交**包裹所有外部效果（provider 请求、真实工具调用），使崩溃点可枚举、可恢复，且**永不重放已结算的效果**。
 5. **execution 问题解决之后，composition 问题浮现**。真实产品不是单进程单界面：TUI / Web / mobile 要同时渲染一个 session，session 要活在长生命周期进程里，插件要能运行时装卸，部分能力必须在另一个进程甚至另一台机器。pi2 的回答是 `chord`——一个**零 Pi 内依赖、可被无关应用复用**的应用组装运行时（facet / service / replicated state / remote boundary）。
-6. **Chord 的真正交付物不是"依赖注入"，而是"能力边界"**。`setup(env)` 的参数表在**类型层面**卡死了插件能拿到什么——presentation facet 永远拿不到裸的 Harness / Session / 工具注册表 / 凭据存储。隔离不是文档约定，是 API 形状。
+6. **Chord 回答两个核心问题，第二个才是它最有特色的地方**：① 怎么把组件装起来（composition）；② 装起来以后每个组件能拿到什么（**capability boundary**）。大多数插件系统只认真做第 1 问；Chord 把第 2 问做进了 API 形状——`setup(env)` 的参数表在**类型层面**卡死了插件能拿到什么，presentation facet 永远拿不到裸的 Harness / Session / 工具注册表 / 凭据存储。隔离不是文档约定，是 API 形状。
 7. **稳定 CLI 与实验性分布式架构并行存在**：稳定版 `pi` CLI 仍跑 `Agent` + JSONL `SessionManager`；`AgentHarness` + Chord facet/RPC + session worker 只在 `src/experimental/` 与 `packages/{protocol,client,server,chord}` 中启用。这是本仓库当前最重要的"双轨"事实。
 8. 代码质量取向极端保守：直连依赖全部 pin 到精确版本、`min-release-age=2`、shrinkwrap 白名单、erasable TypeScript only、`npm run check` 全绿才允许提交。
 
@@ -152,7 +152,9 @@ chord → tui → telemetry → ai → agent → session-backends/sqlite-node
 
 ---
 
-## 3. `pi-ai`：统一多模型 API
+## 3. `pi-ai`：Agent Runtime 依赖的模型层（主线外，可跳过）
+
+> 本章**不在 execution → composition 主线上**，只是为了完整性保留。**赶时间可直接跳到 §4。** 这里只留 AgentHarness 真正依赖的几件事。
 
 ### 3.1 结构
 
@@ -168,14 +170,16 @@ packages/ai/src/
 └── compat.ts / legacy-api-aliases.ts                 # 旧 API 兼容面
 ```
 
-### 3.2 设计要点
+### 3.2 AgentHarness 真正依赖的四件事
 
-- **只收录支持 function calling 的模型**（README 明确），因为 agentic 工作流依赖工具调用。
-- **provider 工厂 + 显式注册**：`createModels()` → `models.setProvider(anthropicProvider())` → `models.getModel("anthropic", "claude-sonnet-4-6")`。没有隐式全局注册表。
-- **`Models` / `ModelRuntime` 双层**：`Models` 是模型注册表 + 流式入口；`ModelRuntime` 负责 auth/凭据组合，供 CLI/SDK 使用。
-- **`AssistantMessageFrame` + `reduceAssistantMessageFrames`** 是 pi2 独有的机制：把 provider 流式事件编码成紧凑恢复帧。harness 只负责把它 append 到有界 list，不重复实现编解码器（§0.7 明确"harness 不定义第二个 frame codec"）。
-- **deferred handle**：provider 返回"稍后完成"的响应（如长思考任务），harness 用 `deferred.suspended ↔ deferred.effect_pending` 轮询状态对建模。
-- **codex 路径**：`openai-codex-responses.ts` 独立实现，说明对 OpenAI Codex 订阅通道有专门支持。
+| 依赖 | 说明 |
+|---|---|
+| **`Models` / `ModelRuntime` 双层** | `Models` 是模型注册表 + 流式入口（`createModels()` → `setProvider()` → `getModel()`，无隐式全局注册表）；`ModelRuntime` 负责 auth/凭据组合，供 CLI/SDK 使用 |
+| **`AssistantMessageFrame`** | pi2 独有机制：把 provider 流式事件编码成紧凑**恢复帧**。harness 只负责把它 append 到有界 list，不重复实现编解码器（`harness.md` §0.7 明确"harness 不定义第二个 frame codec"） |
+| **deferred handle** | provider 返回"稍后完成"的响应（如长思考任务），harness 用 `deferred.suspended ↔ deferred.effect_pending` 轮询状态对建模 |
+| **只收录支持 function calling 的模型** | README 明确——agentic 工作流依赖工具调用 |
+
+其余细节（47 个 provider 工厂、codex 订阅通道的独立实现、overflow 检测、旧 API 兼容面）与主线无关，需要时再查源码。
 
 ---
 
@@ -647,11 +651,40 @@ Scheduler 只懂 task 生命周期、依赖、时序、取消；不懂 prompt、
 
 > §6 已经把问题空间铺平。现在展开答案。
 >
-> 一句话预告全章：**Chord 交付的不是"依赖注入"，而是"能力边界"**——它同时定下"谁提供什么能力"和"谁被允许拿到什么能力"。理解这一点的关键，是看清 `setup(env)` 这个参数表到底给了插件什么、又刻意不给什么（§7.3、§8.4）。
+> 一句话预告全章：**Chord 交付的不是"依赖注入"，而是"能力边界"**——它同时定下"谁提供什么能力"和"谁被允许拿到什么能力"（§7.2 的两个核心问题）。理解这一点的关键，是看清 `setup(env)` 这个参数表到底给了插件什么、又刻意不给什么（§7.3、§8.4）。
+>
+> **阅读约定**：本章每个概念分两层——先用现实问题把它讲清楚，再用 `#### 实现细节` 展开 API / 源码。**第一次读可以跳过所有"实现细节"，只跟主线走**（7.1 → 7.2 → 7.3 → 7.4 → 7.5 → 7.6 → 7.7 → 7.8 → 7.9 → 7.10）；第二次再回来看细节。§7.9 是本章的总结图。
 
 ### 7.1 为什么需要 Chord
 
-把 §6.2 的清单倒过来读，就是 Chord 的存在理由。三个层面：
+先用一个具体场景把它逼出来。
+
+```
+假设 Agent 已经在 worker 进程里跑起来了。
+
+现在又来了三个需求：
+
+- TUI 要显示当前执行进度；
+- RPC client 要远程发起一次 run；
+- 插件要注册一个新的 service。
+
+最简单的办法，是把 Session / Harness / tool registry
+直接暴露给它们。
+
+但这样很快会出问题：
+
+  TUI 拿到了 Harness，就能碰内部状态；
+  插件拿到了 tool registry，就绕过 service 边界；
+  RPC 要跨进程，又不能直接传对象。
+
+所以问题已经不是"Agent 怎么执行"，
+而是：
+
+  一个已经可靠运行的 Agent，如何被拆开、连接、扩展，
+  同时不把内部能力全部暴露出去？
+```
+
+**Chord 解决的就是这个问题。** 把 §6.2 的清单倒过来读，就是它的存在理由。三个层面：
 
 **第一层：execution 问题解决了，但它只解决了一个进程内的一条 lane。**
 `AgentHarness` 的语义边界非常清楚——一个 Session、一条 lane、一个 owner、不做复制、不做调度（§4.12）。这不是缺陷，是刻意的克制。但真实产品要把这条 lane 暴露给多个界面、放进一个长生命周期进程、允许第三方扩展它。这些**全都在 Harness 的语义边界之外**。
@@ -669,6 +702,21 @@ Scheduler 只懂 task 生命周期、依赖、时序、取消；不懂 prompt、
 **Chord 是"把一个应用拆成多个进程/环境中的插件，并用类型化服务把它们再组装起来"的通用运行时。**
 
 它不认识 Harness、TUI、Session、工具——只认识 facet、service、replicated state 和字节边界。
+
+但它其实回答了**两个**核心问题，而不只是一个：
+
+```
+Chord 有两个核心问题：
+
+1. 怎么把组件装起来？              → composition
+2. 装起来以后，每个组件能拿到什么？  → capability boundary
+```
+
+所以更完整的定义是：
+
+> **Chord 不只是一个 application composition runtime，它同时是一个 capability boundary runtime。**
+
+这两句话里，**第二句才是本报告认为最有价值的观察**。大多数"插件系统"只认真解决第 1 问——让插件能挂上去；至于挂上去之后插件能伸手拿到什么，通常靠文档约定和代码评审。Chord 把第 2 问做进了 API 形状（§7.3 的 `setup(env)`、§8.4）。第 1 问是它和 Cordis 相似的地方，第 2 问是它和 Cordis 分道的地方。
 
 身份特征（均有源码实证）：
 
@@ -694,7 +742,23 @@ GitHub Plugin
 
 > **Plugin = 一个完整功能；Facet = 这个功能在不同运行环境里的那一部分。**
 
+把三者放在一起看，关系就清楚了：
+
+```
+Plugin   = 我想提供的完整功能
+Facet    = 这个功能在某个运行环境里的具体部分
+Service  = Facet 对外暴露的能力
+```
+
+一句话串起来：
+
+> **Facet 是"东西住在哪里"，Service 是"它对外能做什么"。**
+
+回到 §2.2 那张主图：图里的 **Presentation** 与 **Worker** 就是不同 facet 所在的环境——同一个插件可以在这两处各有一个 facet，各自只做本地能做的事，彼此通过 Service 说话。
+
 为什么不直接叫 Plugin？因为普通 Plugin 默认"加载进当前程序"，而 Chord 想做的是"**同一个功能可以拆到多个环境**"。这时候单纯叫 Plugin 已经表达不了了。
+
+#### 实现细节
 
 数据结构极简：
 
@@ -735,7 +799,27 @@ setup → assembling → connecting → activating → active
 
 ### 7.4 Service：组件怎么暴露能力
 
-**Service 是一个带类型的稳定 token。** 定义方式是一行：
+先回答一个更基本的问题：**为什么不直接传对象？**
+
+```
+普通设计：
+
+TUI ──► models 对象
+
+问题：
+- TUI 拿到了真实实现
+- 很难跨进程
+- 生命周期由调用方自己猜
+- 没法明确限制它能看到什么
+
+Chord：
+
+TUI ──► Models Service ──► 当前实现 / 远端实现
+```
+
+> 如果你熟悉 NestJS，可以先把 Chord 理解成"**DI 的远亲**"：它也有依赖和 service，但它进一步解决了生命周期、跨进程 binding、状态复制和动态替换。所以它关心的不是"对象怎么注进去"，而是"**能力在哪、由谁提供、什么时候存在、谁可以拿到**"。
+
+这就是为什么 Chord 用的是 token 而不是对象引用：**Service 是一个带类型的稳定 token。** 定义方式是一行：
 
 ```ts
 export interface Models {
@@ -746,6 +830,10 @@ export interface Models {
 }
 export const Models = defineService<Models>("pi.models");
 ```
+
+`defineService` 把"接口类型"和"稳定 id"绑在一行里。TUI 拿到的是这个 **token**，不是那个对象；背后是本地实现还是远端实现，由 Chord 在绑定期决定。回到 §2.2 主图：Presentation 与 Worker 之间**没有直连线**——Service 就是中间那道能力契约。
+
+#### 实现细节
 
 四个维度：
 
@@ -774,6 +862,8 @@ export const Models = defineService<Models>("pi.models");
 
 问题：session worker 里正在跑一个任务，TUI 想实时显示"当前 token 数 / 正在执行哪个工具 / 进度 60%"。这个状态**不该进 Session**（它不是对话历史，是易变的实时视图），也**不该由 TUI 自己轮询**（那要重新发明一套同步协议）。
 
+回到 §2.2 主图：图里 **Worker → Presentation** 那条实时状态传播，就是 replicated state。
+
 Chord 的答案：
 
 ```ts
@@ -787,6 +877,8 @@ status.publish(context);             // 发布一次
 - **消费者**收到**完整不可变值**，不需要理解增量；
 - Chord 每次 publish **flush 一批解码后的操作**（delta），每个远端 client/state 配对拥有**独立的 path-codec 状态**；
 - 副本在断开或替换后变为 **unready**，直到 rehydrate 完成。
+
+#### 实现细节：Delta tracking
 
 **Delta tracking** 是它的底座（`/delta` 可独立使用）：
 
@@ -827,6 +919,8 @@ const replica = apply({ output: "", count: 0 }, ops);
 
 ### 7.6 Remote Boundary：这些能力怎么跨进程
 
+回到 §2.2 主图：**Presentation 与 Worker 之间那条横线**，就是这道边界。它必须存在，否则 TUI 就又能直接碰 Harness 了。
+
 跨进程调用需要一套 wire 语法。Chord 的选择是**只定语法，不定传输**。
 
 Chord 拥有的（transport-independent）：
@@ -853,6 +947,8 @@ Chord **不**拥有（应用方自理）：
 > 规格里还提到 **symmetric RPC peers**（对称 RPC 对等方）作为这个边界的一种可选实现——目前是 planned，不是已实现。
 
 ### 7.7 FacetHost：系统怎么把这些组件装起来
+
+回到 §2.2 主图：FacetHost 就是"**把组件装起来**"那一步的实现——图里 Presentation 与 Worker 各自都有一个 FacetHost，各自只装为本进程构建的 facet。
 
 ```ts
 const host = await createFacetHost({
@@ -942,6 +1038,8 @@ pi 的选择：`ctx.use(Token)` **在设计上就在构造期返回值**——�
 
 把前面所有零件串起来。场景：用户在一个 TUI 里输入 prompt，任务实际在另一个进程里跑，进度实时回显。
 
+> **这一节是 §7 的总结图**：它把 §2.2 的主图从"静态分层"展开成"一次调用的动态过程"——Facet（§7.3）落在哪两个环境、Service（§7.4）怎么当中间契约、Replicated State（§7.5）怎么传播进度、FacetHost（§7.7）怎么组装、Reload（§7.8）怎么替换，全部在这条时序里各就各位。
+
 **① 组装（worker 进程，标准模板）**
 
 ```ts
@@ -1014,6 +1112,8 @@ TUI                    server                 session worker S0              Har
 
 ### 7.10 为什么 Harness 与 Chord 必须分开
 
+回到 §2.2 主图：图的**上半部分是 composition，下半部分是 execution**。这条横线不是画出来的——它是两者不同的核心不变式决定的。
+
 这不是"顺手分了个包"，而是**三个维度上都不该合并**：
 
 | 维度 | `AgentHarness` | `Chord` |
@@ -1067,9 +1167,11 @@ import type { JsonValue } from "@earendil-works/chord";
 | **实现相同** | ❌ 不同。最典型的：Chord 是 `use(Token)` 构造期返回值 + **拆掉依赖方**；Cordis 是 `ctx.get(name)` 访问期守卫 + **代理换实现**（`facets.md` §13.1 明确论证了为什么 pi 拒绝后者）。 |
 | **架构位置相同** | ❌ **完全不同**。这是最关键的一点，详见 §9。 |
 
-**架构位置**的差异一句话概括：
+**架构位置**的差异，一句话概括：
 
-> **Cordis 是"怎么把一个程序拼起来"（进程内的插件树 / 应用框架）；Chord 是"怎么把已经运行起来的多个模块连接起来"（跨进程的运行时连接器）。**
+> **更准确地说，Cordis 更偏向进程内的应用组装与插件树，而 Chord 在此基础上进一步处理运行环境、跨进程边界和 replicated state。**
+
+⚠️ 这句话容易被读成"两者不在一个抽象层"，那就过度切割了。**它们是相邻而不是分离的**：都做插件组合与依赖解析，区别在于**重心**——Cordis 的重心在进程内的组合语义（插件树、事件、可逆副作用），Chord 的重心在跨运行环境的能力边界与状态传播。**重心不同 ≠ 层级不同。**
 
 由此推出两者最根本的不同，也是本报告认为最值得记住的一条：
 
@@ -1159,7 +1261,7 @@ kernel 只在 schema 双向可赋值时允许替换，否则**静默回退到拆
 
 ### 8.4 能力边界：为什么 Chord 故意不让插件拿到 Harness
 
-这是 Chord 最容易被误解、也最重要的一点。
+这是 Chord 最容易被误解、也最重要的一点——也就是 §7.2 说的**第二个核心问题**（"装起来以后，每个组件能拿到什么"）。
 
 §6.6 那条约束——"presentation facet 永远拿不到裸的 Harness / Session / tool registry / hook registry / 凭据存储 / storage handle"——**不是靠代码评审守住的，是靠 API 形状守住的**。
 
@@ -1265,7 +1367,7 @@ dsh 的自我描述：**不存在需要打补丁的特权内核**——模型、
               │                           │
           Cordis                        Chord
               │                           │
-     "程序内部怎么组织"            "运行时模块怎么连接"
+     "进程内的组装与插件树"          "跨环境的能力边界与状态"
               │                           │
         Plugin Tree                  Service Graph
         DI / inject                  Local / Remote
@@ -1274,6 +1376,8 @@ dsh 的自我描述：**不存在需要打补丁的特权内核**——模型、
               │                           │
         application framework       application runtime
 ```
+
+⚠️ **先说清楚读法**：下面的"分界线"描述的是**重心差异**，不是"一个做这个、另一个不做那个"。两者都做插件组合与依赖解析；差别在于各自把工程投入压在哪一侧。把它们读成两个互不相干的抽象层，是本节最想避免的误读。
 
 三条分界线：
 
