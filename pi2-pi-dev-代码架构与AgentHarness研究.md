@@ -1,9 +1,11 @@
 # pi.dev（pi2）代码架构与 Agent Harness 研究报告
 
 > 研究对象：`pi2-source-code/pi`（pi.dev 官方 monorepo，`@earendil-works/*`）
-> 版本：`0.85.1` ｜ HEAD：`71dca871b`（2026-09-11，"fix(ci): Fix a broken test"）
+> 版本：`0.85.1` ｜ **本工作区快照 HEAD**：`71dca871b`（2026-09-11，"fix(ci): Fix a broken test"）
 > 代码规模：11 个 package、约 1.2 万文件（含 node_modules 外的 src/test/docs）
 > 对比基线：`pi-coding-agent-source-code/pi-mono`（pi1，`0.67.68`，2026-04-18）
+>
+> ⚠️ **关于上游最新版本**：有审阅意见指出上游 main 已推进到 `3349e1db`（2026-09-15）。**本机当时无网络，未能独立核实这个哈希**。本文所有源码引用、行号、行为结论**一律以本工作区快照 `71dca871b` 为准**；若上游已变更，请以 `git log` 实际结果校准，不要把上面的上游哈希当作已验证事实。
 
 ---
 
@@ -19,7 +21,45 @@
 
 更准确地说（这个说法比"Harness 就是 Prompt 拼装器"准确得多）：
 
-> **Agent Harness 本质上是一台编译器：输入是"Agent 此刻的状态"，输出是"下一次交给模型的那份内容"。这个编译过程里最核心的一步是 Prompt Assembly——把散落各处的信息整理成模型能直接读的那一份。**
+> **Agent Harness 本质上是一台编译器：输入是"Agent 此刻的状态"，输出是"下一次交给模型的那次请求"。**
+>
+> 而这台"编译器"不是一步完成的，至少可以拆成**四步**：
+
+```
+输入：Agent Runtime State
+      + Session History
+      + Current Configuration
+      + Available Tools
+      + Runtime Hooks / Resources
+              │
+              ▼
+① Context Projection        从 Session / 历史里挑出这次要进上下文的消息
+              │             （scanBranch → buildSessionContext）
+              ▼
+② Request Assembly          补上请求级的东西：systemPrompt、tools、streamOptions
+              │             （resolveSystemPrompt / activeToolNames / before_request）
+              ▼
+③ Provider Encoding         AgentMessage → provider 自己的消息格式与 payload
+              │             （transform_context → toProviderMessages → before_payload）
+              ▼
+④ Effect Execution          真正调用模型，并把结果持久化落定
+              │             （gate.admit → settlement）
+              ▼
+输出：Model Request
+```
+
+> **⚠️ 本报告的一个用词约定。** 很多人（包括本报告的早期版本）会把上面这四步统称为 "Prompt Assembly"。**这不准确**——"组装 prompt"只是第 ①②③ 步里最显眼的部分，第 ④ 步完全不属于 prompt 文字。
+>
+> 所以本文统一用 **Model Request Construction（模型请求构造）** 作为这四步的总称；只在特指"把消息整理成模型能读的那一份"时才说 Prompt Assembly。
+
+**这四步分别对应源码里的哪几处**（后面 §4.3–§4.9 会逐个展开）：
+
+| 阶段 | pi 里的实现 | 详见 |
+|---|---|---|
+| ① Context Projection | `readBoundedContext` → `buildSessionContext`（`harness/runtime/transcript.ts`、`harness/session/context.ts`） | §4.3 |
+| ② Request Assembly | `prepareGeneration`（`harness/runtime/drive/generation.ts`）：`resolveSystemPrompt` + `activeToolNames` → tools + `before_request` 可改 `streamOptions` | §4.1 ②、§4.5、§5.5 |
+| ③ Provider Encoding | `streamHarnessAssistant`（`harness/execution/assistant.ts`）：`transform_context` → `toProviderMessages` → `before_payload` | §4.1 ③、§4.7 |
+| ④ Effect Execution | `gate.admit(() => models.streamSimple(...))` → 流式结果落盘 | §4.7、§4.9 |
 
 两条主线由此确定：
 
@@ -49,13 +89,13 @@ Model Input 从哪里来？
         ↓
 历史 + 状态 + tools + prompt + plugin contributions
         ↓
-所以需要 Context Assembly
+所以需要 Model Request Construction（模型请求构造）
         ↓
-但是 Context Assembly 必须可靠
+但是"构造"必须可靠
         ↓
 Pi → AgentHarness
         ↓
-可靠以后，又遇到"谁可以参与 assembly"
+可靠以后，又遇到"谁可以参与这次构造"
         ↓
 Pi → Chord
         ↓
@@ -78,17 +118,18 @@ DeepSeek → Cordis / Everything is Plugin
 | **prompt** | 笼统地指"交给模型的那段内容"。**它不是一个字符串**，而是由好几条消息拼出来的（系统说明 + 历史 + 工具结果……）。本报告在没有特别说明时，"prompt" 就泛指这份输入里"文字性"的那部分 |
 | **system prompt** | 消息列表最前面那段"系统角色说明"：你是谁、规则是什么、怎么干活 |
 | **messages** | 真正发给 provider 的消息数组，每条带一个角色（system / user / assistant / tool） |
-| **Prompt Assembly** | 把这些东西组装成一次模型输入的过程；在 pi 里就是 §4.3 那套整理算法 |
+| **Model Request Construction / 模型请求构造** | 本报告的总称：把"Agent 当前状态"变成"一次 provider 请求"的完整过程。分成四步（§4.1） |
+| **Prompt Assembly** | 常被笼统用来指"把信息组装成模型能读的输入"。**它不等于全部**——在 pi 里，完整过程还包含请求装配、provider 编码、效果执行三步。本报告凡是要精确时，一律用"模型请求构造" |
 | **prompt template** | 可复用的提示词模板，展开后当成一条用户消息发出去（比如斜杠命令） |
 | **Harness** | 包在模型外面、负责"把活干完"的那层程序：管历史、管状态、管工具、管崩溃恢复 |
 | **Model Input** | 这一次真正发给模型的东西（system prompt + 历史 + 工具定义 + 上下文……） |
-| **Context Assembly / 整理上下文** | 把上面那些零散信息拼成 Model Input 的过程 |
+| **Context Assembly / 整理上下文** | 泛指"把零散信息拼成 Model Input"这件事。**本报告只在一个地方精确用它：讨论"控制权归谁"**（谁有资格决定模型看到什么，§6.8、§8.4、§9）。要指具体机制时一律用"模型请求构造" |
 | **execution** | "保证状态不被崩溃/重试/副作用弄坏"这一半问题 |
 | **composition** | "决定谁的能力、谁的上下文可以进来"这一半问题 |
 | **entry** | 会话树里的一个节点（一条消息、一次压缩摘要……），写进去就不再改 |
 | **lane** | 一条可执行的会话支线：有自己的模型配置、队列和当前操作 |
 | **operation** | 被接受的一次工作单元（跑一轮 / 压缩 / 跳转） |
-| **13 个平铺状态** | pi 文档原话是 `flat 13-leaf union`，指 `state.at` 只能取 13 个值之一，彼此不嵌套。**"leaf（叶子）"是 pi 作者借树结构造的词，不是业界标准术语**；TypeScript 里的正式说法是"联合类型的成员"。详见 §4.7 |
+| **13 个平铺状态** | pi 文档原话是 `flat 13-leaf union`，指 `state.at` 只能取 13 个值之一，彼此不嵌套。**"leaf（叶子）"是 pi 作者借树结构造的词，不是业界标准术语**；TypeScript 里的正式说法是"联合类型的成员"。详见 §4.8 |
 | **facet** | 一个插件在某个运行环境里的那一部分（同一个插件可以有多个 facet） |
 | **service** | facet 对外提供的能力，用"带类型的名字"（token）而不是对象引用来引用 |
 | **replicated state** | 会实时同步到别的进程/界面的状态（比如进度条） |
@@ -172,7 +213,7 @@ LLM
 
 ## 0. 结论速览
 
-0. **本报告的核心判断**：Agent Harness 本质上是一台"把 Agent 状态编译成模型输入"的运行时编译器，Prompt Assembly 是其中最核心的一步。围绕它有两个问题——**execution**（保证这份状态不会因为崩溃、重试、副作用而变得不准确）与 **composition**（决定哪些能力和上下文可以进入这次编译）。pi2 的答案分别是 `AgentHarness`（§4）与 `Chord`（§7）；DeepSeek Harness 的答案是 Cordis + `system-prompt` 子系统（§9）。
+0. **本报告的核心判断**：Agent Harness 本质上是一台"把 Agent 状态编译成模型输入"的运行时编译器。这个编译过程可以拆成四步——**Context Projection → Request Assembly → Provider Encoding → Effect / Settlement**（本报告统称 **Model Request Construction**，§4.1）。围绕它有两个问题——**execution**（保证这份状态不会因为崩溃、重试、副作用而变得不准确）与 **composition**（决定哪些能力和上下文可以进入这次编译）。pi2 的答案分别是 `AgentHarness`（§4）与 `Chord`（§7）；DeepSeek Harness 的答案是 Cordis + `system-prompt` 子系统（§9）。**两者最根本的差异不是插件 API 的形态，而是"谁拥有这次编译的最终解释权"（§9.2）。**
 1. **pi2 把"可持久化的 Agent 运行时"从应用层下沉到了核心层**。pi1 的 `pi-agent-core` 只有 `Agent` + `agent-loop` 两个文件；pi2 新增 `AgentHarness`，用「不可变 entry 树 + 可变更的值/列表 + 只追加的用量账本」三种存储，把崩溃后恢复所需要的全部信息都记录了下来。
 2. **整个 harness 的设计被一条铁律管着**：*任何一份数据，只能出现在 entry、bound value/list、ledger 这三个地方中的一个，没有第四处*。这条铁律的真正作用不是"数据结构漂亮"，而是**让下一次整理上下文时，能一眼分清哪些是已经发生的事实、哪些只是当前这一次运行的临时状态**——所以 `operationState`（本轮运行状态）永远不会混进 conversation history（对话历史）。
 3. **接受（accept）与执行（drive）分离**。`accept` 只把一次操作落盘，不启动任何进程内的工作；`drive` 才真正在进程里跑起来。这让 harness 天然适配"没有常驻调度器的服务端"（定时器、后台任务、HTTP 请求重入都可以）。
@@ -292,9 +333,36 @@ chord → tui → telemetry → ai → agent → session-backends/sqlite-node
 
 读这张图要抓住三点：
 
-1. **Chord 在 Harness 之上，不在其内**。Chord 不认识 Session、Operation、工具；Harness 不认识进程、传输、插件分发。
+1. **Chord 的 composition runtime 在 Harness 之上；但 Chord 的 `Context` 原语在 Harness 之内。** 这是**两个不同层面**的关系，必须分开说（详见下面的"两种关系"图）。
 2. **Presentation 与 Worker 之间没有直连**。所有跨进程调用都经过 Chord 的 service 边界与 server 的路由——这正是"能力边界"落地的地方（§8.4）。
 3. **上下两半的时间尺度不同**。Harness/Session 关心"跨崩溃仍然正确"（秒到天）；Chord 关心"运行中怎么组合与替换"（毫秒到秒）。这个差异是两者必须分开的根本原因（§7.10）。
+
+**两种关系（⚠️ 很容易被简化错）**
+
+把"Chord 与 Harness 的关系"一句话概括成"Chord 在 Harness 上面"，会漏掉一半事实。准确的关系是这样两条：
+
+```
+        Chord composition runtime            AgentHarness
+        facet / service /                    execution / recovery
+        replicated state / remote 边界       accept·drive · 三存储
+                    │                                │
+                    │  ① 组装（composition）          │
+                    └───────────────────────────────►│
+                                                     │
+                                                     │ ② 使用（runtime import）
+                                                     ▼
+                                    @earendil-works/chord/context
+                                    取消 · invocation 作用域值
+                                    （withCancel / withAbortSignal /
+                                      withContextValue / createContextKey …）
+```
+
+- **① 组装方向**：Chord 的 composition runtime 在 Harness **之外**，把 Harness 当作一个被装配的模块装进某个进程的 facet 里。这一层不认识 Session、Operation、工具。
+- **② 依赖方向**：Harness **直接使用** Chord 提供的通用 `Context` 原语。这不是 type-only 依赖——`packages/agent/src/harness/context.ts` 从 `@earendil-works/chord/context` **运行时** import 了 `withCancel` / `withAbortSignal` / `withContextValue` / `createContextKey` / `BACKGROUND_CONTEXT` / `TODO_CONTEXT` / `awaitWithContext` / `withoutAbortSignal` 八个值；`packages/agent/package.json` 也把 `@earendil-works/chord` 列为正式 dependency。
+
+> **所以准确的说法是：Harness 依赖 Chord 的基础上下文原语（cancellation、invocation 作用域值），但不依赖 Chord 的 composition runtime（facet / service / remote / replicated state）。**
+>
+> 两者的关系不是"完全隔离"，而是**分层复用**：底层原语被 Harness 直接用掉，上层组装能力则反过来把 Harness 装起来。
 
 ---
 
@@ -337,48 +405,63 @@ packages/ai/src/
 
 ### 4.1 从 Session 到 Model Input
 
-先看这条链的**全程**。Pi 的每一次 provider 请求，都是从同一份持久事实里挑出来、重新整理出来的：
+先看这条链的**全程**。Pi 的每一次 provider 请求，都是从同一份持久事实里挑出来、重新整理出来的——而且是**四步**：
 
 ```
 Session（不可变 entry 树 + bound values/lists + ledger）
         │
+        │  ══ ① Context Projection ═══════════════════════════════════
         ▼
-   scanBranch（从 tip 反向扫到 compaction 边界）
+   scanBranch({ start: tipId, stopAtType: "compaction", order: "newestFirst" })
+        │   然后 reverse()                         ← readBoundedEntries
+        ▼
+   buildContextEntries（找最后一个 compaction；比它更早的内容永不读取）
         │
         ▼
-   compaction boundary（截断点：更早的内容永不读取）
+   buildSessionContext（逐条 entry 决定产出什么消息）
+        ├── message        → 保留；除非 stopReason 是 error / aborted / deferred
+        ├── compaction     → summary 消息 + retainedTail（同样要过上面那层过滤）
+        ├── branch_summary → 摘要消息（该 entry 有 summary 才产生）
+        └── custom         → 默认丢弃；只有注册了对应 entryProjector 才产出消息
+        │
+        │  ══ ② Request Assembly ═════════════════════════════════════
+        ▼
+   messages
+     + systemPrompt（resolveSystemPrompt：lane 配置 / harness options，可为函数）
+     + tools（activeToolNames → 工具注册表）
+     + streamOptions（before_request hook 可在这里改）
+        │
+        │  ══ ③ Provider Encoding ═══════════════════════════════════
+        ▼
+   transform_context（hook，可以同时改 messages 与 systemPrompt）
         │
         ▼
-   filter（丢弃 error / aborted / deferred 的 assistant 响应）
+   toProviderMessages（AgentMessage → provider 自己的消息格式）
         │
         ▼
-   project（custom entry 过 entryProjectors）
+   before_payload（hook，可以改最终要传出去的 payload）
+        │
+        │  ══ ④ Effect Execution ════════════════════════════════════
+        ▼
+   gate.admit(() => models.streamSimple(...))   ← 检查与调用是同一个同步表达式
         │
         ▼
-   transform_context（hook）
-        │
-        ▼
-   toProviderMessages
-        │
-        ▼
-   messages（从历史整理出来的那部分）
-        │
-        ▼
-   Model Input  ← 还要再加上现算的 systemPrompt / tools（§4.2）
+   流式结果 → 编码成恢复帧 → 持久化落定（settlement）
 ```
 
-本节每一小节都在回答这条链上的一个问题：
+**这条链是本节的组织方式**。本节每一小节都在回答其中的一个问题：
 
 | 小节 | 回答的问题 |
 |---|---|
 | 4.2 Session 是事实来源，不是 Prompt | 事实存在哪？为什么不能直接当 prompt？ |
 | 4.3 Context Projection | 从历史里**选出**这一次需要的内容 |
 | 4.4 哪些机制只在程序内部 | 上面这些机制，**哪些会变成 prompt 文字，哪些模型根本看不到？** |
-| 4.5 Compaction | 历史太长时，如何**重新定义**上下文 |
-| 4.6 Tool / Assistant Durability | 模型刚做过的事，下一轮**怎么看到正确结果** |
-| 4.7 accept / drive | 为什么"接受任务"和"生成下一轮输入"必须**分开** |
-| 4.8 Effect / Replay | 外部世界变了以后，**如何恢复** |
-| 4.9 结论 | 为什么它最终是一个**可恢复的 Context Assembly Runtime** |
+| 4.5 Resource 也是模型输入的一部分 | skill / prompt template 这类"资源"，**怎么进入模型视野？** |
+| 4.6 Compaction | 历史太长时，如何**重新定义**上下文 |
+| 4.7 Tool / Assistant Durability | 模型刚做过的事，下一轮**怎么看到正确结果** |
+| 4.8 accept / drive | 为什么"接受任务"和"生成下一轮输入"必须**分开** |
+| 4.9 Effect / Replay | 外部世界变了以后，**如何恢复** |
+| 4.10 结论 | 为什么它最终是一个**可恢复的 Model Request Construction Runtime** |
 
 ### 4.2 Session 是事实来源，不是 Prompt
 
@@ -396,7 +479,7 @@ Session（不可变 entry 树 + bound values/lists + ledger）
 
 ```
 Model Input
-  ├── messages      ← 从 Session 整理出来的（§4.3 那 5 步）
+  ├── messages      ← 从 Session 投影出来的（§4.3 那 4 步）
   ├── systemPrompt  ← 请求字段。来自 lane 配置 / harness options，可以是一个字符串，
   │                    也可以是每次请求现算的函数；transform_context 还能改写它
   └── tools         ← 请求字段。来自工具注册表与当前 lane 的配置
@@ -478,15 +561,33 @@ await session.appendList(events, event, context);
 
 ### 4.3 Context Projection：从历史里选出这一次需要的内容
 
-Provider 请求的构造是 5 步**固定算法**（注意"固定"二字——这是与 DeepSeek 的关键差异，§9）：
+这是四阶段里的**第 ① 步**，也是唯一"从事实里挑东西"的一步。它的算法是**固定的**（注意"固定"二字——这是与 DeepSeek 的关键差异，§9）。
 
-1. `scanBranch({ start: tip, order: "newestFirst", stopAtType: "compaction" })`
-2. 反转；若被 compaction 截断，则上下文 = `summary` + `retainedTail` + 其后所有 entry。**更早的内容永不读取。**
-3. 丢弃 stopReason 为 `error` / `aborted` / `deferred` 的 assistant 响应（保留真正的 `length`）。
-4. custom entry 会经过 `entryProjectors`，没被整理出来的就不进上下文。
-5. `transform_context` → `toProviderMessages`。
+**阶段 ① 本身是一段固定代码**（`harness/runtime/transcript.ts` → `harness/session/context.ts`），四个动作依次是：
 
-**扩展点只有两个半**：`entryProjectors`（决定 custom entry 怎么进上下文）、`transform_context`（决定最终的消息长什么样）、以及 §4.6 的 hooks。**算法本身不可替换**——这是 Pi 的选择：整理路径固定下来，可靠性才有可能被证明。
+| 步骤 | 函数 | 做什么 |
+|---|---|---|
+| 1 | `scanBranch({ start: tipId, stopAtType: "compaction", order: "newestFirst" })` | 从当前 tip 往回扫，扫到 compaction 就停 |
+| 2 | `.reverse()` | 转成从旧到新 |
+| 3 | `buildContextEntries(entries)` | 找**最后一个** compaction；有的话上下文 = `[compaction, 它之后的全部 entry]`，**比它更早的内容永不读取** |
+| 4 | `buildSessionContext(entries, { entryProjectors })` | 逐条 entry 决定产出什么消息（下表） |
+
+**第 4 步的判定规则**（`sessionEntryToContextMessages`）：
+
+| entry 类型 | 产出什么消息 |
+|---|---|
+| `message` | 保留；但 assistant 消息如果 `stopReason` 是 `error` / `aborted` / `deferred` 就**丢掉**（真正的 `length` 截断保留） |
+| `compaction` | `summary` 摘要消息 + `retainedTail`（保留的尾部，同样要过上面那层过滤） |
+| `branch_summary` | 摘要消息——**但只有该 entry 的 `summary` 非空才产生** |
+| `custom` | **默认产出空**。只有注册了对应 `customType` 的 `entryProjector` 才产出消息 |
+
+**阶段 ① 之后还有三步**（不在这里展开，见 §4.1 的四阶段表）：
+
+- ② **Request Assembly**：补上 `systemPrompt` / `tools` / `streamOptions`；
+- ③ **Provider Encoding**：`transform_context` → `toProviderMessages` → `before_payload`；
+- ④ **Effect Execution**：`gate.admit` → 真正调模型 → 结果落盘。
+
+**扩展点**：阶段 ① 里只有 `entryProjectors` 一个（决定 custom entry 怎么进上下文）；阶段 ②③ 里是 §4.7 的那些 hooks。**阶段 ① 的算法本身不可替换**——这是 Pi 的选择：整理路径固定下来，可靠性才有可能被证明。
 
 **只追加的上下文铁律（append-only context invariant）**：同一个 lane 的多次请求，发给 provider 的上下文只允许在末尾往后加——如果在上一请求的末尾之前插入内容，会让 provider 已经算好的 KV cache 全部作废（KV cache：模型对已经读过的前缀的缓存），成本成倍上升。所以运行过程中产生的内容一律推迟到 checkpoint，追加到末尾。**compaction 是唯一一处故意让 cache 失效的地方。**
 
@@ -502,6 +603,48 @@ Provider 请求的构造是 5 步**固定算法**（注意"固定"二字——�
 
 > **看它最终有没有变成某条 provider message 的"内容"。**
 > 只影响"这条消息什么时候产生、按什么顺序排、崩了怎么恢复"的机制，都不会出现在 prompt 里。
+
+#### 一张总图：到底什么会变成模型能看到的东西
+
+```
+                        Agent Runtime
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+  Durable History       Runtime Config        Resources
+        │                     │                     │
+   entries              systemPrompt          skills
+   branch_summary       tools                 promptTemplates
+   custom entry         streamOptions
+        │                     │                     │
+        └──────────┬──────────┴──────────┬──────────┘
+                   ▼                     ▼
+          Context Projection      Request Assembly
+          （阶段 ①）               （阶段 ②）
+                   └──────────┬──────────┘
+                              ▼
+                     Provider Encoding
+                     （阶段 ③）
+                              ▼
+                        Model Input
+                              ▼
+                             LLM
+
+  ── 模型可见 ─────────────────────────────────────────
+  ✓ messages（含工具调用与结果、摘要）
+  ✓ system prompt
+  ✓ tool schemas（工具定义）
+  ✓ skill 目录列表 / 被显式激活的 skill 正文
+
+  ── 模型不可见 ───────────────────────────────────────
+  ✗ operationState · usage ledger · laneConfig / laneState
+  ✗ Drive / pass / gate.admit · 单写者 · 写入串行线 · 事务
+  ✗ replay 策略 · accept/drive 分离 · events / LaneSnapshot
+  ✗ telemetry · facet 组装 · service 绑定 · replicated state
+  ✗ pi-protocol 分帧 / CBOR
+
+  除非某个显式的 projector / hook / resource 把它们转换进去。
+```
 
 #### 表 A：只在程序内部，模型完全看不到
 
@@ -527,17 +670,25 @@ Provider 请求的构造是 5 步**固定算法**（注意"固定"二字——�
 
 | 东西 | 以什么形式出现 | 由谁决定 |
 |---|---|---|
-| 对话历史（message entry） | provider messages 里的 user / assistant 条目 | Session + §4.3 那 5 步整理算法 |
-| 工具调用与结果 | assistant 的 tool call 条目 + tool 结果条目 | §4.6 的持久化过程 |
-| 压缩摘要 | 一条 summary + 保留的尾部 | §4.5 Compaction |
-| **system prompt** | 请求的 `systemPrompt` 字段（**不是**消息历史里的一条） | lane 配置 / harness options；可以是每次请求现算的函数，`transform_context` 可改写 |
-| **工具定义（tools schema）** | 请求的 `tools` 字段（**不是**消息历史里的一条） | 工具注册表 + 当前 lane 配置 |
+| 对话历史（message entry） | provider messages 里的 user / assistant 条目 | Session + §4.3 的阶段 ① 算法 |
+| 工具调用与结果 | assistant 的 tool call 条目 + tool 结果条目 | §4.7 的持久化过程 |
+| 压缩摘要 | 一条 summary 消息 + `retainedTail` | §4.6 Compaction |
+| 分支摘要（`branch_summary`） | 一条摘要消息（仅当该 entry 的 `summary` 非空） | §4.3 阶段 ① 的 `sessionEntryToContextMessages` |
+| **system prompt** | 请求的 `systemPrompt` 字段（**不是**消息历史里的一条） | lane 配置 / harness options；可以是每次请求现算的函数；`transform_context` 可改写 |
+| **工具定义（tools schema）** | 请求的 `tools` 字段（**不是**消息历史里的一条） | `activeToolNames` → 工具注册表 |
+| **skill 目录列表** | 追加进 **system prompt** 的 `<available_skills>` 块（只有 name / description / location） | `formatSkillsForSystemPrompt`（§4.5） |
+| **被显式激活的 skill 正文** | 一条 **user 消息**里的 `<skill …>…</skill>` | `formatSkillInvocation`（§4.5） |
 | custom entry 被 `entryProjectors` 整理后的内容 | 变成普通消息 | 扩展注册的 projector |
 | `transform_context` 改写后的结果 | 最终的 messages **和** systemPrompt | hook |
+| `before_payload` 改写后的结果 | 最终传输的 payload | hook |
 | 图片 / 附件（如果作为 entry 内容） | 消息里的图片块 | 写入该 entry 的工具或扩展 |
 | 运行时状态里**被显式写进 entry 的部分** | 消息文字 | 只有"真的写进 entry"才会出现 |
 
-> 表 B 里只有前三行和最后三行来自 Session；**system prompt 与工具定义是"请求字段"，每次请求现算**，不进入会话历史。这一点在 §9.6 会再次用到。
+> 分三类看这张表：
+>
+> 1. **来自 Session**（阶段 ①）：对话历史、工具调用与结果、压缩摘要、分支摘要、被投影的 custom entry。
+> 2. **每次现算的请求字段**（阶段 ②）：system prompt、工具定义——**不进入会话历史**，这一点在 §9.6 会再次用到。
+> 3. **资源与 hook 的产物**（阶段 ②③）：skill 目录列表（进 system prompt）、被激活的 skill 正文（进消息历史）、`transform_context` 与 `before_payload` 的改写结果。
 
 #### 三组最容易混淆的，单独澄清
 
@@ -558,7 +709,95 @@ hook 本身是程序内部的钩子，模型看不到。只有被分到 `transit
 
 这也正好回答了阅读指引里那个说法：**把 Harness 叫成"Prompt 拼装器"太窄了**——拼装只是它最后一步的可见产物，前面那一整套（状态机、崩溃恢复、效果准入、并发写入、插件边界）都发生在模型视野之外。
 
-### 4.5 Compaction：当历史太长，如何重新定义上下文
+### 4.5 Resource 也是模型输入的一部分：以 Skill 为例
+
+§4.4 的表 B 里列了"什么会进模型"。但有一类东西很容易被漏掉：**资源（Resource）**。
+
+Harness 的 options 里有这么一个字段（`harness/types.ts:73`）：
+
+```ts
+/** Resources made available to explicit invocation methods and system-prompt callbacks. */
+export interface AgentHarnessResources<TSkill extends Skill = Skill, TPromptTemplate extends PromptTemplate = PromptTemplate> {
+  promptTemplates?: TPromptTemplate[];   // 提示词模板
+  skills?: TSkill[];                     // 技能
+}
+```
+
+注意注释里的两个词：**explicit invocation**（显式调用）和 **system-prompt callbacks**（系统提示词回调）。这暗示了 Skills 有一个很有意思的性质——**同一个 skill，可以有两种完全不同的"可见性"**。
+
+#### 两种可见性
+
+`Skill` 的类型是（`harness/types.ts:49`）：
+
+```ts
+export interface Skill {
+  name: string;                       // 稳定名字（对模型可见）
+  description: string;                // 简短描述（对模型可见）
+  content: string;                    // 完整正文（默认对模型不可见！）
+  filePath: string;                   // 绝对路径（对模型可见，用于解析相对引用）
+  disableModelInvocation?: boolean;   // 不参与"目录列表"，但仍可被显式调用
+}
+```
+
+**注意 `content` 那一行**：完整正文**默认不会进模型**。这是理解 Skills 的关键。
+
+| | 方式 A：目录级可见性 | 方式 B：显式激活 |
+|---|---|---|
+| 谁触发 | 系统提示词里自动列出 | 有人显式调用这个 skill |
+| 代码 | `formatSkillsForSystemPrompt()`（`harness/system-prompt.ts`） | `formatSkillInvocation()`（`harness/skills.ts:39`） |
+| 产出 | 一段 XML 块 | 一条 **user 消息** |
+| 进了哪 | **system prompt** | **会话历史**（因此会一直留在后续上下文里） |
+| 带什么 | 只有 `name` / `description` / `location` | `name` / `location` / **完整 `content`** |
+
+方式 A 的实际产物长这样：
+
+```xml
+The following skills provide specialized instructions for specific tasks.
+Read the full skill file when the task matches its description.
+...
+<available_skills>
+  <skill>
+    <name>pdf</name>
+    <description>Use this skill whenever the user wants to do anything with PDF files...</description>
+    <location>/Users/…/skills/pdf/SKILL.md</location>
+  </skill>
+</available_skills>
+```
+
+方式 B 的产物是一段被包起来的正文，然后被塞进一条 `role: "user"` 的消息（`harness/runtime/lane.ts:537`）：
+
+```xml
+<skill name="pdf" location="/Users/…/skills/pdf/SKILL.md">
+References are relative to /Users/…/skills/pdf.
+
+（这里才是完整的 SKILL.md 正文）
+</skill>
+```
+
+**PromptTemplate 走的是同一条路**（`lane.ts` 的 `case "prompt_template"`）：`formatPromptTemplateInvocation(template, args)` 做参数替换，产物同样作为消息进入会话。
+
+#### 为什么这个例子重要
+
+它把本报告的核心论点从抽象变成了具体。回到 §4.4 那句判断标准——"看它最终有没有变成某条 provider message 的内容"——Skill 恰好给出了一个**同一份数据、两种命运**的例子：
+
+- 只把 `name` + `description` + `location` 放进 **system prompt**：模型知道"有这么个技能"，但不知道它具体怎么做；
+- 把 `content` 放进 **一条 user 消息**：模型拿到了完整操作说明，而且**这条消息从此留在历史里**，后续每一轮都会重新被整理进上下文。
+
+所以 Skill 不是"一段提示词"，而是**一个被 Agent Runtime 管理可见性的资源**：
+
+```
+Resource（Skill / PromptTemplate）
+        │
+        ├── 目录级 → 进 system prompt（轻、常驻、每轮都在）
+        │
+        └── 显式激活 → 进会话历史（重、一次性写入、之后一直跟着）
+```
+
+这正是"**Agent Runtime 不是'拼一条 prompt'，而是管理不同来源、不同生命周期、不同语义的模型可见信息**"最直接的证据。`before_run` hook 的事件里同时带着 `prompt` 和 `resources` 两个字段（`agent-harness.ts:424`），也从侧面印证了：在这套设计里，**资源与消息是并列的两类输入**。
+
+> ⚠️ 一个容易被忽略的细节：方式 A 的产物进的是 **system prompt**，方式 B 的产物进的是 **会话历史**。这意味着**同一份 skill 内容，会因为"怎么进去"而拥有完全不同的持久性和缓存行为**——方式 B 一旦写入，就永远改变了后续每一轮的上下文（并且会破坏 §4.3 那条只追加铁律的"尾部"位置假设，因为它追加在尾部，所以是安全的）。
+
+### 4.6 Compaction：当历史太长，如何重新定义上下文
 
 - **compaction 是一份自包含的检查点，不是指向历史的指针**。它不是"从这里往前看"的游标，而是一份完整摘要 + 保留的尾部；整理上下文时读它，而不是读它之前的所有东西。
 
@@ -566,7 +805,7 @@ hook 本身是程序内部的钩子，模型看不到。只有被分到 `transit
 
 压缩的产物是 `summary` + `retainedTail`，它**替换**了上下文从哪里开始算——所以压缩既是管理上下文的机制，也是唯一允许让 provider KV cache 失效的地方。
 
-### 4.6 Tool / Assistant Durability：模型刚做过的事，下一轮怎么看到正确结果
+### 4.7 Tool / Assistant Durability：模型刚做过的事，下一轮怎么看到正确结果
 
 模型看到的世界里，工具结果必须**恰好出现一次**。这一节讲 Pi 怎么保证。
 
@@ -626,7 +865,7 @@ outcome_ready
 - **`LaneSnapshot` + `reduceLaneSnapshot`**：客户端这个折叠函数是规范的一部分——把快照和自己收到的事件序列折叠在一起，得到下一个快照；遇到 `navigation_end` 时返回 `{ rebase: true }`，客户端调用 `resnapshot()` 重新取一份，而不是重建订阅。
 - `watch()` 在写入串行线上抓取一个**一致快照**，然后把之后的事件按顺序暴露出来。
 
-### 4.7 accept / drive：为什么"接受任务"和"生成下一轮输入"必须分开
+### 4.8 accept / drive：为什么"接受任务"和"生成下一轮输入"必须分开
 
 **四个原语**
 
@@ -695,7 +934,7 @@ idle ──accept run──► starting ──before_run──► checkpoint
 - **单写者规则**：同一时刻只有一个 Drive 能推进顶层状态。inbox 方法只改 inbox 字段，`requestAbort` 只改 control，`close` 只是禁止新的写入进来——因此一个正在运行的 operation，它的身份和 `at` 状态值不可能被并发改掉。唯一的例外是并行工具的子调用（兄弟状态之间确实会竞争）。
 - **Session 写入串行线（mutation line）**：一条不带 key 的串行队列。`Session.mutate()` 是回调式的便利封装（保证在 `finally` 里执行 `end()`）。**禁止在这个回调内部再调用公开的写方法**（会把自己排到队尾，死锁）。
 
-### 4.8 Effect / Replay：外部世界变了以后，如何恢复
+### 4.9 Effect / Replay：外部世界变了以后，如何恢复
 
 - **效果准入闸门（effect gate）**：`gate.admit(() => invoke())` 把"检查"和"调用"放在同一个同步表达式里，中间不让出执行权。准备工作必须在 `admit` **之前**做完，否则取消可能在准备期间抢先生效。
 
@@ -713,7 +952,7 @@ const stream = drive.gate.admit(() =>         // 检查与调用是同一个同�
 
 这是**对"下一次模型看到什么"的直接承诺**：读操作可以重跑（结果一样），写操作不能重跑（世界已经变了）——所以写操作崩溃后，模型看到的是"这条调用被中断了"这个**事实**，而不是一条伪造的成功结果。**replay 策略不是性能选项，是上下文正确性的一部分。**
 
-### 4.9 结论：为什么 Pi 的 Harness 最终是一个"可恢复的 Context Assembly Runtime"
+### 4.10 结论：为什么 Pi 的 Harness 最终是一个"可恢复的 Model Request Construction Runtime"
 
 **后端：Memory / JSONL / SQLite 同一套一致性测试**
 
@@ -761,12 +1000,14 @@ SQLite 的两个不那么显然的点：
 
 把 §4 的所有机制放回同一个问题，它们回答的其实是同一件事：
 
-> **下一次 Context Assembly 的输入，怎么保证是正确的？**
+> **下一次模型请求构造的输入，怎么保证是正确的？**
 
 | 机制 | 它保证的事 |
 |---|---|
 | 三存储铁律 | 分清"事实"与"运行状态" |
-| Context Projection | 从事实里**选出**这一次要什么 |
+| ① Context Projection | 从事实里**选出**这一次要什么 |
+| ② Request Assembly | 把选出的历史 + system prompt + tool 定义**装成一次请求**（每次重算，不写回历史） |
+| ③ Provider Encoding | 把请求**翻译成 provider 真正收到的字节**（最后一道可插手的关口） |
 | Compaction | 太长时如何**重新定义** |
 | Tool / Assistant Durability | 刚发生的事**恰好出现一次**，且顺序确定 |
 | accept / drive | "生成输入"这件事本身**也可恢复** |
@@ -775,7 +1016,7 @@ SQLite 的两个不那么显然的点：
 
 所以更准确的称呼是：
 
-> **`AgentHarness` 是一个"可恢复的 Context Assembly Runtime"——它的首要产物不是"执行了任务"，而是"每一次都给模型一个正确、可复现、可恢复的 Model Input"。**
+> **`AgentHarness` 是一个"可恢复的 Model Request Construction Runtime"——它的首要产物不是"执行了任务"，而是"每一次都给模型一个正确、可复现、可恢复的 Model Input"。**
 
 ---
 
@@ -873,7 +1114,7 @@ export default function (pi: ExtensionAPI) {
 
 ### 5.7 Skills / Prompt Templates / Themes / Pi Packages
 
-- **Skills**：实现 [Agent Skills 标准](https://agentskills.io/specification)，但有意放宽"name 必须等于目录名"这一条（理由是共享 skill 目录场景）。渐进式披露——只有 name/description 常驻上下文，完整 `SKILL.md` 按需 `read` 加载。可从 `~/.claude/skills`、`~/.codex/skills` 直接复用其他 harness 的 skill。
+- **Skills**：实现 [Agent Skills 标准](https://agentskills.io/specification)，但有意放宽"name 必须等于目录名"这一条（理由是共享 skill 目录场景）。渐进式披露——只有 name/description 常驻上下文，完整 `SKILL.md` 按需 `read` 加载。可从 `~/.claude/skills`、`~/.codex/skills` 直接复用其他 harness 的 skill。**这条"渐进式披露"在 Harness 层有两种落地方式（目录级 vs 显式激活），产出的模型可见性完全不同——见 §4.5。**
 - **Prompt templates**：斜杠命令展开的复用提示词。
 - **Pi Packages**：把扩展/skill/提示词/主题打包，经 npm 或 git 分发（`pi install npm:@foo/bar@1.0.0`）。
 - **Themes**：内置 + 自定义终端主题。
@@ -1052,7 +1293,7 @@ Scheduler 只懂 task 生命周期、依赖、时序、取消；不懂 prompt、
 ```
 State
   ↓
-Context Assembly        ← 把当前状态编译成模型能读的输入
+Model Request Construction   ← 把当前状态编译成模型能读的输入（§4.1 四步）
   ↓
 Model Input
   ↓
@@ -1070,16 +1311,16 @@ State
 
 于是 Pi 和 DeepSeek 的真正区别就浮出来了：
 
-> **不是有没有 Agent Loop，也不是有没有 Plugin，而是 Context Assembly 的控制权在哪里。**
+> **不是有没有 Agent Loop，也不是有没有 Plugin，而是 Context Assembly 的控制权在哪里。**（这里 "Context Assembly" 指的是控制权问题，不是 §4.1 那四个具体步骤）
 
 | | 谁控制 Model Input 的构造 |
 |---|---|
-| **Pi** | Harness 控制**核心 assembly**（§4.3 那条 5 步固定算法）；Chord 控制**外部 composition**（谁有资格贡献 service / state / hook） |
+| **Pi** | Harness 控制**内核四阶段**（§4.1 的 Context Projection → Request Assembly → Provider Encoding → Effect，代码写死、顺序固定）；Chord 控制**外部 composition**（谁有资格贡献 service / state / hook） |
 | **DeepSeek** | Cordis 控制 **plugin composition**；agent loop / prompt / tools 本身也参与 composition（§9 详述） |
 
 这正是 §7 要展开的东西：
 
-> **Chord 决定"谁有资格参与 Context Assembly，以及以什么能力参与"。**
+> **Chord 决定"谁有资格参与这次构造，以及以什么能力参与"。**
 
 ---
 
@@ -1089,7 +1330,7 @@ State
 >
 > 一句话预告全章：**Chord 交付的不是"依赖注入"，而是"能力边界"**——它同时定下"谁提供什么能力"和"谁被允许拿到什么能力"（§7.2 的两个核心问题）。理解这一点的关键，是看清 `setup(env)` 这个参数表到底给了插件什么、又刻意不给什么（§7.3、§8.4）。
 >
-> 用 §6.8 的话说：**Chord 决定谁有资格参与 Context Assembly，以及以什么能力参与。** 它不是"让插件能改 prompt"，而是"让插件通过受控的 service / state / hook 参与，而不是绕过 assembly 直接改模型看到的世界"。
+> 用 §6.8 的话说：**Chord 决定谁有资格参与这次构造，以及以什么能力参与。** 它不是"让插件能改 prompt"，而是"让插件通过受控的 service / state / hook 参与，而不是绕过这条受控路径直接改模型看到的世界"。
 >
 > **阅读约定**：本章每个概念分两层——先用现实问题把它讲清楚，再用 `#### 实现细节` 展开 API / 源码。**第一次读可以跳过所有"实现细节"，只跟主线走**（7.1 → 7.2 → 7.3 → 7.4 → 7.5 → 7.6 → 7.7 → 7.8 → 7.9 → 7.10）；第二次再回来看细节。§7.9 是本章的总结图。
 
@@ -1125,7 +1366,7 @@ State
 **Chord 解决的就是这个问题。** 把 §6.2 的清单倒过来读，就是它的存在理由。三个层面：
 
 **第一层：execution 问题解决了，但它只解决了一个进程内的一条 lane。**
-`AgentHarness` 的语义边界非常清楚——一个 Session、一条 lane、一个 owner、不做复制、不做调度（§4.9 的非目标清单）。这不是缺陷，是刻意的克制。但真实产品要把这条 lane 暴露给多个界面、放进一个长生命周期进程、允许第三方扩展它。这些**全都在 Harness 的语义边界之外**。
+`AgentHarness` 的语义边界非常清楚——一个 Session、一条 lane、一个 owner、不做复制、不做调度（§4.10 的非目标清单）。这不是缺陷，是刻意的克制。但真实产品要把这条 lane 暴露给多个界面、放进一个长生命周期进程、允许第三方扩展它。这些**全都在 Harness 的语义边界之外**。
 
 **第二层：跨进程的"能力组合"缺少一层通用设施。**
 如果没有它，每个团队会各自发明：一套 RPC 约定、一套插件加载器、一套状态同步、一套生命周期管理。这四套东西彼此不知道对方存在，且都无法被复用。Chord 的定位就是把这四件事收进一个**通用、可被无关应用复用**的运行时。
@@ -1141,6 +1382,8 @@ State
 
 它不认识 Harness、TUI、Session、工具——只认识 facet、service、replicated state 和字节边界。
 
+> 补充一句：Chord 除了这套组装能力，还导出一层**通用 `Context` 原语**（取消传播 + 作用域键值，`@earendil-works/chord/context`）。这一层小到可以被完全不需要 facet 的子系统直接用掉——Harness 就是直接用了它（§2.2 的"两种关系"）。**组装能力和 Context 原语要分开看。**
+
 但它其实回答了**两个**核心问题，而不只是一个：
 
 ```
@@ -1155,6 +1398,8 @@ Chord 有两个核心问题：
 > **Chord 不只是一个 application composition runtime，它同时是一个 capability boundary runtime。**
 
 这两句话里，**第二句才是本报告认为最有价值的观察**。大多数"插件系统"只认真解决第 1 问——让插件能挂上去；至于挂上去之后插件能伸手拿到什么，通常靠文档约定和代码评审。Chord 把第 2 问做进了 API 形状（§7.3 的 `setup(env)`、§8.4）。第 1 问是它和 Cordis 相似的地方，第 2 问是它和 Cordis 分道的地方。
+
+> ⚠️ **"capability boundary" 的准确范围（不要读大）。** 这里说的能力边界，指的是**组装期 / 进程边界**上的能力授予：一个 facet 在 setup 期能拿到哪些 service 句柄、能不能跨进程拿、跨进程时数据能不能过 strict JSON。它**不等于一个完整的安全授权系统**——它不做用户身份、不做权限策略引擎、不做运行时审计日志、不阻止"两个都拿到句柄的插件互相合作绕过限制"。它是**能力边界的下限（谁能拿到什么）**，而不是安全模型的全部。把这两件事分开，才不会高估 Chord 的作用。
 
 身份特征（均有源码实证）：
 
@@ -1235,7 +1480,7 @@ setup → assembling → connecting → activating → active
 - `own` 可在 setup / active 期；
 - service 句柄只能在 active 期使用，销毁时收回。
 
-### 7.4 Service：组件如何向 Context Assembly 提供能力
+### 7.4 Service：组件如何参与模型请求构造
 
 先回答一个更基本的问题：**为什么不直接传对象？**
 
@@ -1281,7 +1526,7 @@ Worker
   ↓
 Harness
   ↓
-Context Assembly                 ← 真正构造 Model Input 的地方
+Model Request Construction       ← 真正构造 Model Input 的地方（§4.1 四步）
 ```
 
 关键点：**插件不是直接改 prompt 字符串**。它只能：
@@ -1294,7 +1539,7 @@ Harness / composition layer
 构造 Model Input
 ```
 
-这条路径是**间接的、受控的、可审计的**。插件想让模型看到新东西，不能往 prompt 里塞字符串，而必须让某个 service 或 hook 在 assembly 时把它带进去——而这正是"能力边界"要保护的东西（§8.4）。
+这条路径是**间接的、受控的、可审计的**。插件想让模型看到新东西，不能往 prompt 里塞字符串，而必须让某个 service 或 hook 在构造过程里把它带进去——而这正是"能力边界"要保护的东西（§8.4）。
 
 #### 实现细节
 
@@ -1568,7 +1813,7 @@ TUI                    server                 session worker S0              Har
 | 观察 | 对应机制 |
 |---|---|
 | TUI 不知道 Harness 在哪、怎么 RPC | Chord service 边界（§7.4、§7.6） |
-| 关掉 TUI 再打开，任务还在跑 | worker 持有 Harness，operation 已落盘（§4.7 accept/drive 分离） |
+| 关掉 TUI 再打开，任务还在跑 | worker 持有 Harness，operation 已落盘（§4.8 accept/drive 分离） |
 | 进度是实时的，但**没进 Session** | replicated state 是 Live Distributed State（§7.5） |
 | 插件替换时 TUI 没看到服务消失 | 候选先激活 + 原子切换（§7.8） |
 | TUI 拿不到凭据 / 工具注册表 | `setup(env)` 参数表在类型层面卡死（§8.4） |
@@ -1577,36 +1822,57 @@ TUI                    server                 session worker S0              Har
 
 回到 §2.2 主图：图的**上半部分是 composition，下半部分是 execution**。这条横线不是画出来的——它是两者各自的核心铁律不同所决定的。
 
+⚠️ 先澄清一个容易搞混的点：**"分开"指的是"不把 composition runtime 塞进 Harness"，不是"两者零依赖"**。Harness 确实运行时依赖 Chord 的 `Context` 原语（§2.2 的"两种关系"）——但那是通用原语，不是组装能力。
+
 这不是"顺手分了个包"，而是**三个维度上都不该合并**：
 
 | 维度 | `AgentHarness` | `Chord` |
 |---|---|---|
 | **核心铁律** | "数据只存在于 entry / bound value-list / ledger 三者之一" | "依赖图先验证后绑定，按相反顺序销毁" |
 | **时间尺度** | 跨崩溃仍然正确（秒 → 天） | 运行中组合与替换（毫秒 → 秒） |
-| **依赖方向** | 只 `import type` chord（`Context` / `JsonValue`） | 零 Pi 内依赖 |
+| **依赖方向** | 依赖 chord 的**基础原语**（运行时 import `Context` 一族 + 类型） | 零 Pi 内依赖 |
 
-第三行是最硬的证据。看 `agent` 包对 chord 的实际引用：
+第三行需要**说准确**——这里曾经容易被写错。看 `agent` 包对 chord 的实际引用（`packages/agent/src/harness/context.ts`）：
 
 ```ts
-// packages/agent/src/harness/context.ts / session/types.ts
+// 类型：只取类型
 import type { Context, ContextKey } from "@earendil-works/chord";
-import type { JsonValue } from "@earendil-works/chord";
+
+// 运行时：真的 import 了值
+import {
+  awaitWithContext,
+  BACKGROUND_CONTEXT,
+  createContextKey,
+  TODO_CONTEXT,
+  withAbortSignal,
+  withCancel,
+  withContextValue,
+  withoutAbortSignal,
+} from "@earendil-works/chord/context";
 ```
 
-**全是 `import type`。** 稳定版 Harness 根本没用 facet / service 运行时，只复用了 `Context` 与 JSON 类型。连核心层都只取其类型、不取其运行时——这是"独立工具库"最有力的证据，也是"两者职责不同"最直接的证明。
+**注意：第二组是运行时 import，不是 `import type`。** 同时 `packages/agent/package.json` 也把 `@earendil-works/chord` 列为正式 dependency（`"^0.85.1"`）。
 
-如果强行合并会怎样：
+所以第三行最准确的表述是：
+
+> **Harness 依赖 Chord 的 `Context` 原语（取消、invocation 作用域值），但不依赖 Chord 的 composition runtime。**
+
+**为什么这不影响"两者该分开"的结论？** 因为被复用的东西只有一样：**通用的 `Context` 抽象**。它是一个零业务含义的通用原语（取消传播 + 作用域键值），谁都可以用；Harness 用它，Chord 自己也用它。真正属于 Chord 的**组装能力**——`FacetHost` / `Service` / `replicatedState` / remote binding / 依赖图校验——Harness **一样都没用**。
+
+换句话说：**复用的是"词汇表"，不是"运行时"。** 这与"两者职责不同"并不矛盾，反而说明 Chord 的 `Context` 层切得干净——它小到可以被一个完全不需要 facet 的子系统直接拿去用。
+
+如果强行把组装能力也塞进来会怎样：
 
 - Chord 就得懂 Session / Operation / 工具参数 / hook 语义 → 它就不再是"可以被无关应用复用"的通用运行时；
 - Harness 就得懂进程、传输、插件分发、generation 管理 → 它的三存储铁律会被外部生命周期污染。
 
 正确的组合方式是**装配，不是合并**：
 
-> **实验性架构 = 用 Chord 装配 Harness。** presentation 与 session worker 只是被装到了不同进程的 facet 里；Harness 本身完全不知道自己被装进了什么容器。
+> **实验性架构 = 用 Chord 装配 Harness。** presentation 与 session worker 只是被装到了不同进程的 facet 里；Harness 本身完全不知道自己被装进了什么容器——它只知道"我在一个 `Context` 里跑"。
 
 一句话总结本节：
 
-> **`AgentHarness` 是"单 lane 持久化执行"的专用答案；`Chord` 是"多进程插件组装"的通用答案。前者是后者的被装配对象，不是它的一个模块。**
+> **`AgentHarness` 是"单 lane 持久化执行"的专用答案；`Chord` 是"多进程插件组装"的通用答案。前者是后者的被装配对象，不是它的一个模块——但两者共用同一套底层 `Context` 原语。**
 
 ### 7.11 Chord 与 DeepSeek Harness 的对应关系（速览）
 
@@ -1768,26 +2034,34 @@ env.onDeactivate(cb)        → 退役回调
 
 不是因为"它会读到一个不该读的字段"，而是因为：
 
-> **它拿到内部对象以后，就可以绕过受控的 Context Assembly 路径，直接改变模型看到的世界。**
+> **它拿到内部对象以后，就可以绕过受控的构造路径，直接改变模型看到的世界。**
 
 具体来说，如果 TUI 手里有裸 Harness，它就能：
 
-- 往 Session 里追加 entry → 下一轮整理上下文时，这些 entry 会**自动进入**模型上下文；
-- 直接改 `laneState` / 配置 → 改变模型收到的运行时状态；
+- 往 Session 里追加 entry → 下一轮做 Context Projection 时，这些 entry 会**自动进入**模型上下文；
+- 直接改 `laneState` / 配置 → 改变模型收到的运行时状态（影响 §4.4 的 ② Request Assembly）；
 - 拿到 hook registry → 在 `transform_context` 里任意改写 provider messages。
 
-这三件事都不需要"恶意"，只需要"方便"。而一旦发生，**§4 建立起来的那条"整理上下文"的链路就不再是唯一入口**——"下一次模型看到什么"就变成了一个无法审计的问题。
+这三件事都不需要"恶意"，只需要"方便"。而一旦发生，**§4 建立起来的那条构造链就不再是唯一入口**——"下一次模型看到什么"就变成了一个无法审计的问题。
 
 所以能力边界的最终目的，不是保护对象，而是保护**这条链的唯一性**：
 
 ```
-Plugin ──(只能走)──► Service / State / Hook ──► 受控的 Context Assembly ──► Model Input
+Plugin ──(只能走)──► Service / State / Hook ──► 受控的构造链 ──► Model Input
              ╳ 不能绕过这条链
 ```
 
-这条链的终点——也就是"**到底什么东西最后会变成 prompt 文字**"——§4.4 有逐项清单。对照那份清单可以看得更清楚：插件真正能"写进模型视野"的入口只有两个（写 entry、注册 hook），其余全是程序内部机制。
+这条链的终点——也就是"**到底什么东西最后会变成 prompt 文字**"——§4.4 有逐项清单。对照那份清单，插件真正能"写进模型视野"的入口可以归成三类，**而不是只有一条**：
 
-**这就是 Chord 与 Context Assembly 的最终连接点**：Chord 管的不只是"组件怎么装起来"，而是"**谁有资格参与这次编译，以及以什么能力参与**"。
+| 类别 | 具体入口 | 落点 |
+|---|---|---|
+| **A. 写持久历史** | 追加 Session entry（消息、branch_summary、custom） | 下一轮 ① Context Projection 读出来 |
+| **B. 参与构造过程** | 注册 hook：`before_request`（可改 `streamOptions`）、`transform_context`（可改 messages / systemPrompt）、`before_payload` | ②③ 两个阶段内部 |
+| **C. 提供显式资源** | `systemPrompt`（字符串或函数）、`tools`、`skills`、`promptTemplates`、`projectors` | 被 ② Request Assembly 或 ① Projection 取用 |
+
+其余全是程序内部机制，插件碰不到。**关键不是"入口有几个"，而是这三个入口都在受控链上**——每个入口都在某个明确的阶段、有明确的形状，而不是"往 prompt 字符串里塞东西"。
+
+**这就是 Chord 与控制权的最终连接点**：Chord 管的不只是"组件怎么装起来"，而是"**谁有资格参与这次构造，以及以什么能力参与**"。
 
 ---
 
@@ -1836,7 +2110,7 @@ export function apply(ctx: Context) {
 
 | 问题 | Pi | DeepSeek Harness |
 |---|---|---|
-| **谁构造模型输入** | Harness 整理 `messages`（固定 5 步，§4.3）+ 现算 `systemPrompt` / `tools` | plugin/context + prompt assembly（waterfall，瀑布式事件） |
+| **谁构造模型输入** | Harness 投影 `messages`（固定投影算法，§4.3）+ 现算 `systemPrompt` / `tools`（§4.1 ②） | plugin/context + prompt assembly（waterfall，瀑布式事件） |
 | **Prompt 是什么** | 三块：`messages`（从 Session 整理）+ `systemPrompt`（请求字段，现算）+ `tools`（请求字段）。**system prompt 不进入历史** | SystemPrompt + PromptContext + history 等，**全部作为消息进入派生历史** |
 | **谁能贡献 prompt / context** | `entryProjectors` / hooks / runtime mechanisms | Cordis plugins / `PromptSection` / `PromptContext` |
 | **Tool 如何进入模型** | 定义走请求的 `tools` 字段；调用与结果走持久化的 entry | `tools` service / tool plugins |
@@ -1845,11 +2119,43 @@ export function apply(ctx: Context) {
 | **崩溃恢复** | 显式建模（operation 状态 / 效果状态） | 重点不完全相同，更多靠 plugin/context/session 的组合 |
 | **Composition 发生在哪里** | Harness **外部**，由 Chord 组装 | Harness **内部**，Cordis 本身就是组合机制 |
 | **插件能改变什么** | 受 Chord service 边界限制 | 原则上很多核心行为本身就是 plugin |
+| **谁拥有最终解释权**<br>（assembly ownership） | Harness 内建的 `generation + context projection`（§4.1 四阶段）**拥有解释权**；hooks 只能在规定的位置介入（一个封闭集合，§9.3） | `system-prompt` service + Cordis waterfall：**plugin graph 参与、甚至包住整个 assembly**（`system-prompt/assemble` 本身是 waterfall 事件） |
 | **核心哲学** | **durable execution first（先把持久执行做可靠）** | **everything is a plugin（一切都是插件）** |
+
+**这张表最该读出来的是倒数第二行。** 两边的差异不在于"谁的插件 API 更灵活"，也不在于"谁用了 Facet 谁用了 Plugin"——那只是实现形式。真正的分野是：
+
+> **谁拥有 Context Assembly 的最终解释权。**
+
+Pi 把解释权**收进内核**：四阶段写死，插件只能在预先规定的位置（hooks、`entryProjectors`、resources）介入，介入点是一个**封闭集合**。dsh 把解释权**交给 plugin graph**：连 `system-prompt/assemble` 本身都是一个可以被包住的 waterfall 事件，所以"谁决定模型看到什么"这个问题没有内核级答案，只能去 plugin 图里找。
 
 注意最后一行的对称性：两边的哲学**不是同一个命题的正反面，而是两个不同的首要关切**。Pi 先要"不会错"，再谈"能不能换"；dsh 先要"什么都能换"，再把可靠性当作插件组合的一个性质。
 
-### 9.3 两张 Prompt Assembly 图
+#### Prompt 是 request field，还是 derived history？
+
+上表"Prompt 是什么"那一行值得单独拎出来，因为它常被含糊带过。两边给出的答案是**结构性不同**的：
+
+**Pi：三块东西，来源不同。**
+
+```
+Model Input
+  ├── messages      ← derived history（从 Session 投影出来的，§4.3）
+  ├── systemPrompt  ← request field（每次现算，不落盘）
+  └── tools         ← request field（每次现算，不落盘）
+```
+
+源码证据：`agent-loop.ts:296` 组装的就是 `{ systemPrompt, messages, tools }` 三个字段；`harness/runtime/drive/generation.ts` 在每次请求前重新算 `systemPrompt` 和 `tools`。**system prompt 从头到尾不进 Session、不进消息历史**——它只是这一次请求的参数。
+
+**dsh：system prompt 本身就是一条消息。**
+
+dsh 的 prompt 被提交成一个 `system/message` 表面节点，也就是说：
+
+> **prompt 是"派生历史的一部分"，而不是一个独立的请求字段。**
+
+这个差别会带来可观测的后果：在 dsh 里，system prompt 会随历史一起被 compaction、被快照、被版本化；在 Pi 里它不会——它每轮重新生成，天然免疫历史压缩。
+
+**读法提醒**：这一条不是"谁更好"，而是**两种关于"prompt 到底是什么"的本体论选择**。把它和上面的"解释权"放在一起看，就能理解为什么两边的 `transform_context` / `system-prompt` 机制长得完全不同：它们对"prompt 是什么"的定义从根上就不一样。
+
+### 9.3 两张构造管线图
 
 **Pi：固定的整理管线**
 
@@ -1858,7 +2164,7 @@ export function apply(ctx: Context) {
                  │                              │
                  ▼                              ▼
         Context Projection              systemPrompt 现算（可为函数）
-        （5 步固定算法 §4.3）            tools 现算（工具注册表 + lane 配置）
+        （§4.3 固定投影）                 tools 现算（工具注册表 + lane 配置）
                  │                              │
                  ▼                              ▼
              messages  ───────────┬───────  systemPrompt / tools
@@ -1872,7 +2178,7 @@ export function apply(ctx: Context) {
 
 > **"谁允许改变这条 pipeline？"**
 >
-> 答案是一个**封闭集合**：Harness 自己（算法固定）+ hooks（三类持久性，§4.6）+ `entryProjectors` + `transform_context` + service 提供的数据 + Chord 控制的贡献。
+> 答案是一个**封闭集合**：Harness 自己（算法固定）+ hooks（三类持久性，§4.7）+ `entryProjectors` + `transform_context` + service 提供的数据 + Chord 控制的贡献。
 >
 > 而且 §4.3 的**只追加上下文铁律（append-only context invariant）**给这条 pipeline 加了一道硬约束：**只能在尾部追加**。所以"改 prompt"在 Pi 这里从来不是"随便改字符串"。
 >
@@ -1905,7 +2211,7 @@ export function apply(ctx: Context) {
 
 | | Pi | DeepSeek |
 |---|---|---|
-| context / prompt 的组装 | **固定 5 步算法**，扩展点窄且显式 | **`system-prompt/assemble` 本身就是一个 waterfall 事件**，插件可以包住整个组装过程（microkernel 笔记把它与 `agent/request`、`tools/execute` 并列为 waterfall 类） |
+| context / prompt 的组装 | **固定四阶段流水线**（§4.1），扩展点窄且显式 | **`system-prompt/assemble` 本身就是一个 waterfall 事件**，插件可以包住整个组装过程（microkernel 笔记把它与 `agent/request`、`tools/execute` 并列为 waterfall 类） |
 | 含义 | 整理路径不可替换，可靠性才可证明 | 组装过程本身可以被插件改写、短路、恢复 |
 
 这**不是**谁更先进的问题，而是**两种可靠性策略**：Pi 把可靠性放在"路径固定"上，dsh 把可靠性放在"事件语义明确 + 卸载即回滚"上。
@@ -1923,7 +2229,7 @@ export function apply(ctx: Context) {
                         ↓
                AgentHarness
                         ↓
-                 Context Assembly
+         Model Request Construction
                         ↓
                       LLM
 ```
@@ -1933,7 +2239,7 @@ export function apply(ctx: Context) {
 - Session 怎么存（三存储铁律）
 - Operation 怎么恢复（13 个平铺状态）
 - Tool 怎么 replay（`safe` / `never`）
-- 上下文怎么整理（5 步固定算法）
+- 上下文怎么投影（固定四阶段算法，§4.1）
 
 然后 **Chord 在外面**负责把它装起来。
 
@@ -2086,7 +2392,7 @@ core instructions
 | **替换方式** | **拆掉依赖方**（teardown of dependents）；持有者随提供者一起死 | **代理换实现**；consumer 保持存活，`inject` 让插件进入 PENDING 并在服务回归时自动重激活 | Chord 拒绝代理模型，理由见 §8.3 |
 | **副作用回收** | `env.own(disposal)` + `onDeactivate`；资源所有权绑定在 facet 的作用域上 | `ctx.effect(() => disposer)`；**所有对上下文的变更最终都归结为这一个原语** | Cordis 更统一；Chord 更显式（分阶段守卫） |
 | **命名/键** | 强类型 token + `chord.*` 命名空间 + `$chord.*` 保留前缀 | 字符串键 `ctx.get('name')` + 论文提出的 **coeffect 类型表 Σ** | 前者靠 token 与保留前缀，后者靠类型系统建模字符串键 |
-| **事件地位** | harness 事件是**被动观察**（§4.6"永不驱动执行"）；**Chord 甚至没有 event bus** | 有类型的事件是**一等公民式的协调机制**（`emit`/`parallel`/`serial`/`bail`/`waterfall`） | 相反的设计取向 |
+| **事件地位** | harness 事件是**被动观察**（§4.7"永不驱动执行"）；**Chord 甚至没有 event bus** | 有类型的事件是**一等公民式的协调机制**（`emit`/`parallel`/`serial`/`bail`/`waterfall`） | 相反的设计取向 |
 | **隔离原语** | 跨进程 facet（进程/环境即边界）+ service 契约 | `ctx.isolate(key, realm)` 作用域隔离 + `ctx.intercept(key, meta)` 拦截依赖访问 | Chord 的边界是**进程级**；Cordis 的是**作用域级** |
 
 **三层判断必须分开说**，否则会得出错误结论：
@@ -2103,7 +2409,7 @@ core instructions
 2. **把"可逆副作用"当作扩展 API 的契约**：pi 的扩展卸载/热替换今天靠人工写对清理逻辑（`worker.ts` 的 `retired.dispose()`）；Cordis 把"注册即附带撤销"做进了框架（所有上下文变更都归结为 `ctx.effect`，而且**每个注册都返回一个 disposer**——dsh 的 `ctx.systemPrompt.section()` 等 API 正是这个形态）。可以直接对标 Chord 的 `own()` 机制补齐——**但要注意 §8.3 的取舍**：Cordis 的统一原语是有代价的（代理模型），照搬会丢掉 Chord 现在的能力边界。
 3. **`PromptContext` 式的"贡献 + 排序 + 快照"三件套**：dsh 把动态上下文做成了**可注册、可排序、可抑制（`suppressRuntimeContext()`）、带缓存安全快照语义**的一等对象。pi 目前的对应物是 `entryProjectors` + `transform_context`，扩展点更窄、也更不显式。若 pi 未来要让插件更规范地贡献运行时上下文，dsh 这个形态是现成参考——**而且它不违反 pi 的只追加铁律**（快照只追加在保留历史之后）。
 
-反过来，dsh 若借鉴 pi，最值得拿的是**§4 的崩溃恢复完备性**（13 个平铺状态 + accept/drive 分离 + replay 契约）与**§4.6 的"事件不驱动"纪律**——这两样在 dsh 的公开文档里找不到等价物。
+反过来，dsh 若借鉴 pi，最值得拿的是**§4 的崩溃恢复完备性**（13 个平铺状态 + accept/drive 分离 + replay 契约）与**§4.7 的"事件不驱动"纪律**——这两样在 dsh 的公开文档里找不到等价物。
 
 ---
 
@@ -2142,14 +2448,61 @@ core instructions
 12. **诚实的实现状态清单**：`harness.md` §0.9 逐条列出未实现项与契约上的欠账。这在真实工程里极其少见，也极其有用。
 13. **双轨演进**：新内核（AgentHarness）先在 experimental 与独立包中成型，用 `mini` 这类最小真实客户端压测，再谈替换稳定路径。
 14. **通用设施零内部依赖**：`chord` 不依赖任何 Pi 包——这既是它可复用的前提，也是它不变质的保险（它无法偷偷去懂 Harness）。
-15. **把"输入"当成一等产物**（本报告的核心视角）：Harness 的产出不只是"执行了任务"，而是"**每一次都给模型一个正确、可复现、可恢复的 Model Input**"。一旦这样定义，三存储、整理上下文、压缩、replay、能力边界就全部收敛到同一个问题——**"下一次给模型什么"由谁决定、怎么保证正确**。这个框架比"Harness = 状态机 + 插件 API"更有解释力。
-16. **保护"整理上下文"这条链的唯一性**：能力边界的深层目的不是保护对象，而是保证"模型看到的输入"只有一条受控路径（§8.4）。任何"绕过 assembly 直接改上下文"的口子，都会让"下一次模型看到什么"变成不可审计的问题。
+15. **把"输入"当成一等产物**（本报告的核心视角）：Harness 的产出不只是"执行了任务"，而是"**每一次都给模型一个正确、可复现、可恢复的 Model Input**"。一旦这样定义，三存储、上下文投影、压缩、replay、能力边界就全部收敛到同一个问题——**"下一次给模型什么"由谁决定、怎么保证正确**。这个框架比"Harness = 状态机 + 插件 API"更有解释力。
+16. **保护构造链的唯一性**：能力边界的深层目的不是保护对象，而是保证"模型看到的输入"只有一条受控路径（§8.4）。任何"绕过受控构造直接改上下文"的口子，都会让"下一次模型看到什么"变成不可审计的问题。
 17. **把"模型输入"当成算出来的，而不是存下来的**：pi 的 `messages` 从 Session 整理、`systemPrompt` 与 `tools` 每次请求现算（§4.2）；dsh 的 prompt 由 `PromptSection` 装配。两边的共同点是"输入是算出来的"。
     ⚠️ 但**具体做法不同**：dsh 把 prompt 提交成派生历史里的一条 `system/message`，pi 则把它保留为请求字段。这是本报告修正过的一处判断——不要把两者说成"独立得出了同一结论"（详见 §9.6）。
 
 ---
 
-## 12. 风险与未完成项
+## 12. 收束：从 Execution / Composition 到四层模型
+
+本报告开头把 Agent Harness 拆成 **execution**（保证状态不被崩溃/重试/副作用弄坏）与 **composition**（决定谁的能力与上下文能进来）两个问题。这个拆法**足够用来组织章节**，但它其实不是架构本身——它是**两个横切的关切**，会同时穿过下面每一层。
+
+真正的结构是四层。把这四层连起来看，"Agent Harness 是什么"就有了一个不留空档的答案：
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│ L3  Effect + Settlement                                          │
+│     对外部世界的动作：调模型、执行工具。                              │
+│     先落"要做" → 执行 → 落"结果"。可恢复、不重放。                    │
+│     ← §4.7 Tool/Assistant Durability · §4.9 Effect/Replay        │
+├──────────────────────────────────────────────────────────────────┤
+│ L2  Model Request Construction                                   │
+│     ② Request Assembly  补 systemPrompt / tools / streamOptions   │
+│     ③ Provider Encoding transform_context → toProviderMessages    │
+│     ← §4.1 ②③ · §4.5 Resource · §5.5 system prompt               │
+├──────────────────────────────────────────────────────────────────┤
+│ L1  Context Projection                                           │
+│     从事实历史里"选出"这一次要什么。算法固定、只允许尾部追加。          │
+│     ← §4.3 · §4.6 Compaction                                     │
+├──────────────────────────────────────────────────────────────────┤
+│ L0  Durable Truth                                                │
+│     Session entry 树 / bound values & lists / usage ledger        │
+│     "任何数据只能待在这三个地方之一，没有第四处。"                     │
+│     ← §4.2 三存储铁律                                             │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**为什么这个四层模型比"execution + composition"更有解释力：**
+
+| | execution / composition | 四层模型 |
+|---|---|---|
+| 是什么 | 两个**横切关切**，会穿过每一层 | **数据流的分层**，层与层之间是"产物→输入"的关系 |
+| 回答的问题 | "会不会坏" / "谁能进来" | "模型看到的东西，是在哪一层被决定的" |
+| 能否定位差异 | 只能说"两边侧重不同" | 能指出**分歧具体发生在哪一层**：Pi 把 L1/L2 的解释权收进内核；dsh 把它开放给 plugin graph（§9.2） |
+| 能否解释 Chord | 只能说"Chord 负责 composition" | 能说清 Chord 管的是 **L1/L2 的准入**——谁有资格往 L0 写、谁有资格在 L1/L2 的固定位置上贡献（§8.4 三类入口） |
+
+**两条读法。**
+
+1. **自下而上**：L0 是唯一的真相；L1 是"从真相里挑"；L2 是"把挑出来的装成请求"；L3 是"把请求变成世界的改变，再把结果写回 L0"。整个循环就是 §6.8 那个 `State → Model Input → LLM → Output → State`。
+2. **自上而下（更适合排查问题）**：当"模型看到的东西不对"时，**从 L3 往 L0 倒着查**——是 effect 的结果没落定（L3）？是 provider 编码改错了（L2 ③）？是 system prompt 没算对（L2 ②）？是投影选错了条目（L1）？还是真相本身写坏了（L0）？**每一层都有独立的可观测边界，所以问题可以定位到层。**
+
+这正是本报告认为 Pi 这套设计最值得学的地方：**它把"模型看到什么"这件事，从一件含糊的、跨层的、只能靠读代码理解的事，变成了一条分层、可定位、每一层都有明确契约的流水线。**
+
+---
+
+## 13. 风险与未完成项
 
 | 风险 | 说明 | 影响 |
 |---|---|---|
@@ -2165,9 +2518,9 @@ core instructions
 
 ---
 
-## 13. 附录：关键文件索引
+## 14. 附录：关键文件索引
 
-### 13.1 规格与设计文档
+### 14.1 规格与设计文档
 
 | 路径 | 内容 |
 |---|---|
@@ -2198,7 +2551,7 @@ core instructions
 | `docs/subsystems/core.md` / `docs/cordis-primer.md` | 各子系统与 Cordis 概念参考 |
 | `docs/cookbook/extension-cookbook.md` | "feature → mechanism map"（每个功能映射到一个 listener） |
 
-### 13.2 核心源码
+### 14.2 核心源码
 
 | 路径 | 行数 | 内容 |
 |---|---|---|
